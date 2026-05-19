@@ -231,6 +231,24 @@ Photo slot assignment (in order received):
 If fewer photos than slots: reuse first photo for remaining slots.
 Never leave a slot empty if any photos were provided.
 
+PHOTO COLLECTION SEQUENCE — always follow this order:
+
+1. Ask for subject property photos first as a dedicated batch:
+   "Send subject property photos now — aerial, street view, 
+   storefront, interior. Say 'done' when finished."
+
+2. Wait for 'done' before moving on.
+   Never mix subject photos with comp photos.
+
+3. Comp photos come from uploaded MLS/LoopNet PDFs — 
+   extracted automatically with the comp data.
+   Do not ask for separate comp photo uploads unless 
+   broker explicitly says they have standalone images.
+
+4. If broker uploads a standalone comp photo:
+   Ask immediately: "Which comp is this photo for? 
+   Give me the address or comp number."
+   Never assume attribution from upload order.
 ---
 
 ### STEP 5 — COMPARABLES
