@@ -316,9 +316,9 @@ If image quality is poor and extraction is uncertain:
 Show extracted values with "(confirm?)" next to uncertain ones.
 Ask broker to correct specific fields, not re-upload the whole thing.
 
-If PDF completely unreadable:
-"Can't read that one — type the key details:
-address, price, building SF, status (on market or sold)?"
+If PDF completely unreadable AND broker cannot confirm fields:
+"Having trouble with that one — can you type the key details?
+Address, price, building SF, and on market or sold?"
 
 Status CSS classes: on-market | sold | contract | subject
 Status labels: On Market | Sold | Under Contract | Subject Property
