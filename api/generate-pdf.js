@@ -33,13 +33,10 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         source: html_content,
-        landscape: true,           // BPO is landscape format
-        use_print: true,           // Use print CSS
-        format: 'Letter',          // 8.5 x 11
-        margin: '0',               // Template handles its own margins
-        javascript: true,          // Allow JS rendering
-        wait_for: 500,             // Wait 500ms for fonts to load
-        filename: sanitizeFilename(property_address) + '.pdf',
+        landscape: true,
+        format: 'Letter',
+        margin: '0',
+        delay: 500,                // Wait 500ms for fonts to load (PDFShift v3 param)
       }),
     });
 
