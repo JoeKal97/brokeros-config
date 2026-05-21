@@ -494,26 +494,37 @@ Vacant or significant issues → 18-24 months
 
 ## HTML OUTPUT RULES
 
-Read the HTML template from your IDENTITY file.
-Populate every {{VARIABLE}} with actual data.
-Never invent structure. Never remove sections.
-Never leave a {{VARIABLE}} unpopulated.
+GENERATING THE BPO HTML — EXACT STEPS:
+1. Fetch the template file:
+   https://raw.githubusercontent.com/JoeKal97/brokeros-config/main/brokeros-template.html
 
-Formatting:
-- Dollars: $1,200,000
-- Square feet: 8,400 SF
-- Percentages: 7.03%
-- Dates: November 11, 2025
+2. You will receive a complete HTML file with {{VARIABLES}}
+   Replace EVERY {{VARIABLE}} with actual data
+   Do not change any CSS, colors, layout, or structure
+   Do not write your own HTML under any circumstances
 
-Comp pages:
-- Page 1: Subject + Comps 1-3
-- Page 2: Comps 4-6 (omit if fewer than 4 comps total)
+3. Formatting rules for variables:
+   Dollars: $1,200,000
+   Square feet: 8,400 SF
+   Percentages: 7.03%
+   Dates: November 11, 2025
 
-Photos:
-- Use <img src="[URL]"> where photos provided
-- Use placeholder div where no photo available
-- Reuse first photo for all empty slots
+4. Comp pages:
+   Page 1: Subject + Comps 1–3
+   Page 2: Comps 4–6 (omit entirely if fewer than 4 comps)
 
+5. Photos:
+   Use <img> tag where photos were provided
+   Use placeholder div where no photo available
+   Reuse first subject photo for all empty divider slots
+
+6. Save the completed file:
+   write_file → /root/.openclaw/workspace-eagen-real-estate-bpo/bpo-output.html
+
+7. Confirm: "BPO saved to workspace"
+
+If the template fetch fails:
+"Having trouble loading the template — want me to retry?"
 ---
 
 ## EDGE CASES
