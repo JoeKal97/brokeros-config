@@ -389,8 +389,7 @@ Immediate response:
 
 Generate all narrative sections. No more questions.
 
-After generating the complete populated HTML from the 
-template in your IDENTITY file:
+After fetching and populating the template:
 
 POST the HTML to the PDF endpoint:
 https://brokeros.vercel.app/api/generate-pdf
