@@ -392,7 +392,23 @@ Generate all narrative sections. No more questions.
 After fetching and populating the template:
 
 POST the HTML to the PDF endpoint:
-https://brokeros.vercel.app/api/generate-pdf
+https://brokeros-config.vercel.app/api/generate-pdf
+
+Send as JSON with these exact keys:
+{
+  "html_content": "[the complete populated HTML string]",
+  "property_address": "[full address]",
+  "broker_id": "eagen"
+}
+
+The endpoint returns a PDF file directly as a download.
+Save it to the workspace as bpo-[address].pdf
+Then tell the broker:
+"✅ Your BPO is ready — bpo-[address].pdf
+Open it in a browser to view or download."
+
+If the endpoint returns an error:
+"⚠️ PDF conversion hit a snag — want me to retry?"
 
 Include: broker_id, property_address, html_content
 
