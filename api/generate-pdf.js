@@ -1,3 +1,4 @@
+// redeploy trigger
 // /api/generate-pdf.js
 // BrokerOS — PDF Generation Endpoint
 // Receives HTML from OC, converts via PDFShift, returns PDF URL
