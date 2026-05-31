@@ -1,8 +1,11 @@
-// redeploy trigger
 // /api/generate-pdf.js
 // BrokerOS — PDF Generation Endpoint
-// Receives HTML from OC, converts via PDFShift, returns PDF URL
-// Deploy to Vercel — set PDFSHIFT_API_KEY in environment variables
+// Receives HTML from OC, converts via PDFShift, returns the PDF.
+// Deploy to Vercel — set PDFSHIFT_API_KEY in environment variables.
+//
+// Accepts BOTH application/json and application/x-www-form-urlencoded bodies
+// (Vercel parses either into req.body). OC currently posts form-urlencoded to
+// bypass a JSON-body firewall block; no code change is needed for that.
 
 export default async function handler(req, res) {
 
@@ -18,11 +21,34 @@ export default async function handler(req, res) {
   }
 
   // Extract payload from OC
-  const { html_content, property_address, broker_id } = req.body;
+  const { html_content, property_address, broker_id } = req.body || {};
 
-  if (!html_content) {
+  // --- FIX 1: BOM / leading-whitespace guard -------------------------------
+  // Strip a leading UTF-8 BOM (U+FEFF) and any leading whitespace. PDFShift
+  // rejects a source that doesn't START with <!DOCTYPE / <html / http(s),
+  // and a stray BOM or newline silently breaks it.
+  let source = (html_content || '').replace(/^\uFEFF/, '').trimStart();
+
+  if (!source) {
     return res.status(400).json({ error: 'No HTML content provided' });
   }
+
+  // --- FIX 2: prefix validation --------------------------------------------
+  // Turn PDFShift's cryptic "source must start by..." 400 into a clear,
+  // self-explaining error before we ever call the API.
+  if (!/^(<!doctype|<html|https?:\/\/)/i.test(source)) {
+    return res.status(400).json({
+      error: 'Invalid HTML',
+      detail: 'html_content must start with "<!DOCTYPE", "<html", or "http(s)://". '
+            + 'Check for stray leading text, BOM, or chat/log prefixes.'
+    });
+  }
+
+  // --- FIX 3: orientation ---------------------------------------------------
+  // Default to PORTRAIT. The BPO/CMA/OM templates are portrait (8.5in x 11in);
+  // the old hardcoded landscape:true rotated and broke their layout.
+  // Optional per-request override: send landscape=true (bool or "true" string).
+  const landscape = (req.body.landscape === true || req.body.landscape === 'true');
 
   try {
     // Call PDFShift API
@@ -33,11 +59,11 @@ export default async function handler(req, res) {
         'Authorization': 'Basic ' + Buffer.from('api:' + apiKey).toString('base64'),
       },
       body: JSON.stringify({
-        source: html_content,
-        landscape: true,
+        source: source,
+        landscape: landscape,      // default false (portrait)
         format: 'Letter',
         margin: '0',
-        delay: 500,                // Wait 500ms for fonts to load (PDFShift v3 param)
+        delay: 500,                // wait 500ms for fonts to load (PDFShift v3 param)
       }),
     });
 
