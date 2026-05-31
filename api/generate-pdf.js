@@ -44,11 +44,28 @@ export default async function handler(req, res) {
     });
   }
 
-  // --- FIX 3: orientation ---------------------------------------------------
-  // Default to PORTRAIT. The BPO/CMA/OM templates are portrait (8.5in x 11in);
-  // the old hardcoded landscape:true rotated and broke their layout.
+  // --- FIX 3: orientation (default PORTRAIT) --------------------------------
+  // The templates render correctly as portrait; landscape rotated/broke them.
   // Optional per-request override: send landscape=true (bool or "true" string).
   const landscape = (req.body.landscape === true || req.body.landscape === 'true');
+
+  // --- FIX 4: zoom (scale design to fit the page) --------------------------
+  // The template authors each .page at a fixed 1100px width, which is wider
+  // than a Letter portrait page (~816px). Without scaling, content bleeds off
+  // both sides. `zoom` scales the whole render down to fit. Default 0.74
+  // (816/1100) pulls the 1100px design inside the portrait page width.
+  // Override per request with zoom=<number>.
+  let zoom = parseFloat(req.body.zoom);
+  if (!Number.isFinite(zoom) || zoom <= 0) {
+    zoom = 0.74;   // default: fit 1100px design into Letter portrait width
+  }
+
+  // --- FIX 5: margin (optional, default 0) ---------------------------------
+  // Margins come from the zoom scaling + the template's own internal padding.
+  // Override per request with margin=<value> if needed.
+  const margin = (req.body.margin !== undefined && req.body.margin !== null)
+    ? String(req.body.margin)
+    : '0';
 
   try {
     // Call PDFShift API
@@ -61,8 +78,9 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         source: source,
         landscape: landscape,      // default false (portrait)
+        zoom: zoom,                // default 0.74 (fit 1100px design to page)
         format: 'Letter',
-        margin: '0',
+        margin: margin,            // default '0'
         delay: 500,                // wait 500ms for fonts to load (PDFShift v3 param)
       }),
     });
