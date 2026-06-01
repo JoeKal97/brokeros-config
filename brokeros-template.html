@@ -1343,6 +1343,14 @@
     color: #999;
   }
 
+  /* === PDF PAGINATION FIX — force each .page to its own physical page === */
+.page-wrapper { display: block; padding: 0; }   /* flex was blocking page breaks */
+.page {
+  margin: 0 auto;                                /* keep horizontal centering */
+  break-after: page;    page-break-after: always;
+  break-inside: avoid;  page-break-inside: avoid;
+}
+.page:last-child { break-after: auto; page-break-after: auto; }  /* no trailing blank */
 </style>
 </head>
 <body>
