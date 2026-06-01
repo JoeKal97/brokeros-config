@@ -4,8 +4,23 @@
 // Deploy to Vercel — set PDFSHIFT_API_KEY in environment variables.
 //
 // Accepts BOTH application/json and application/x-www-form-urlencoded bodies
-// (Vercel parses either into req.body). OC currently posts form-urlencoded to
-// bypass a JSON-body firewall block; no code change is needed for that.
+// (Vercel parses either into req.body). OC posts form-urlencoded to bypass a
+// JSON-body firewall block; no code change is needed for that.
+//
+// Defaults are tuned for the BrokerOS template family (landscape 11x8.5 pages
+// authored at 1100x850px): landscape orientation + zoom 0.88, and an injected
+// pagination stylesheet so every broker's template breaks at its .page
+// boundaries. All are overridable per-request.
+
+// Pagination safety-net CSS (Option B): forces each .page onto its own physical
+// page for ANY template using the house .page / .page-wrapper convention.
+// Injected last (before </head>) so it overrides the template's own rules.
+const PAGINATION_CSS =
+  '<style id="brokeros-pagination-fix">' +
+  '.page-wrapper{display:block;padding:0;}' +
+  '.page{margin:0 auto;break-after:page;page-break-after:always;break-inside:avoid;page-break-inside:avoid;}' +
+  '.page:last-child{break-after:auto;page-break-after:auto;}' +
+  '</style>';
 
 export default async function handler(req, res) {
 
@@ -23,19 +38,16 @@ export default async function handler(req, res) {
   // Extract payload from OC
   const { html_content, property_address, broker_id } = req.body || {};
 
-  // --- FIX 1: BOM / leading-whitespace guard -------------------------------
-  // Strip a leading UTF-8 BOM (U+FEFF) and any leading whitespace. PDFShift
-  // rejects a source that doesn't START with <!DOCTYPE / <html / http(s),
-  // and a stray BOM or newline silently breaks it.
+  // --- BOM / leading-whitespace guard --------------------------------------
+  // PDFShift rejects a source that doesn't START with <!DOCTYPE / <html /
+  // http(s); a stray BOM or newline silently breaks it.
   let source = (html_content || '').replace(/^\uFEFF/, '').trimStart();
 
   if (!source) {
     return res.status(400).json({ error: 'No HTML content provided' });
   }
 
-  // --- FIX 2: prefix validation --------------------------------------------
-  // Turn PDFShift's cryptic "source must start by..." 400 into a clear,
-  // self-explaining error before we ever call the API.
+  // --- Prefix validation ----------------------------------------------------
   if (!/^(<!doctype|<html|https?:\/\/)/i.test(source)) {
     return res.status(400).json({
       error: 'Invalid HTML',
@@ -44,27 +56,36 @@ export default async function handler(req, res) {
     });
   }
 
-  // --- FIX 3: orientation (default PORTRAIT) --------------------------------
-  // The templates render correctly as portrait; landscape rotated/broke them.
-  // Optional per-request override: send landscape=true (bool or "true" string).
-  const landscape = (req.body.landscape === true || req.body.landscape === 'true');
-
-  // --- FIX 4: zoom (scale design to fit the page) --------------------------
-  // The template authors each .page at a fixed 1100px width, which is wider
-  // than a Letter portrait page (~816px). Without scaling, content bleeds off
-  // both sides. `zoom` scales the whole render down to fit. Default 0.74
-  // (816/1100) pulls the 1100px design inside the portrait page width.
-  // Override per request with zoom=<number>.
-  let zoom = parseFloat(req.body.zoom);
-  if (!Number.isFinite(zoom) || zoom <= 0) {
-    zoom = 0.74;   // default: fit 1100px design into Letter portrait width
+  // --- Pagination injection (Option B; default on) -------------------------
+  // Insert the safety-net CSS so .page divs break at their boundaries even if a
+  // template forgets the rules. Opt out with paginate=false.
+  const injectPagination = !(req.body.paginate === false || req.body.paginate === 'false');
+  if (injectPagination) {
+    if (/<\/head>/i.test(source)) {
+      source = source.replace(/<\/head>/i, PAGINATION_CSS + '</head>');
+    } else if (/<\/body>/i.test(source)) {
+      source = source.replace(/<\/body>/i, PAGINATION_CSS + '</body>');
+    } else {
+      source = source + PAGINATION_CSS;
+    }
   }
 
-  // --- FIX 5: margin (optional, default 0) ---------------------------------
-  // Margins come from the zoom scaling + the template's own internal padding.
-  // Override per request with margin=<value> if needed.
-  const margin = (req.body.margin !== undefined && req.body.margin !== null)
-    ? String(req.body.margin)
+  // --- Layout controls (per-request; defaults tuned for the template) ------
+  // landscape: DEFAULT TRUE. The BrokerOS templates author pages at 1100x850px
+  //   (= Letter LANDSCAPE, 11x8.5in). Send landscape=false to override.
+  // zoom: DEFAULT 0.88. Absorbs the 100px/in design vs 96px/in render oversize,
+  //   fits 1100x850 within Letter-landscape with margins, and keeps each .page
+  //   under one physical page (above ~0.92 a page can overflow). Range 0.1-2.
+  // margin: page margin; '0' lets the design's own padding + zoom set the margins.
+  const landscape = (req.body.landscape === false || req.body.landscape === 'false')
+    ? false
+    : true;
+
+  const zoomRaw = parseFloat(req.body.zoom);
+  const zoom = (!isNaN(zoomRaw) && zoomRaw >= 0.1 && zoomRaw <= 2) ? zoomRaw : 0.88;
+
+  const margin = (req.body.margin !== undefined && req.body.margin !== '')
+    ? req.body.margin
     : '0';
 
   try {
@@ -77,10 +98,10 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         source: source,
-        landscape: landscape,      // default false (portrait)
-        zoom: zoom,                // default 0.74 (fit 1100px design to page)
+        landscape: landscape,
+        zoom: zoom,
         format: 'Letter',
-        margin: margin,            // default '0'
+        margin: margin,
         delay: 500,                // wait 500ms for fonts to load (PDFShift v3 param)
       }),
     });
