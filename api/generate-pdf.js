@@ -1,20 +1,34 @@
 // /api/generate-pdf.js
-// BrokerOS — PDF Generation Endpoint
-// Receives HTML from OC, converts via PDFShift, returns the PDF.
+// BrokerOS — PDF Generation Endpoint (server-side assembly)
 // Deploy to Vercel — set PDFSHIFT_API_KEY in environment variables.
 //
-// Accepts BOTH application/json and application/x-www-form-urlencoded bodies
-// (Vercel parses either into req.body). OC posts form-urlencoded to bypass a
-// JSON-body firewall block; no code change is needed for that.
+// TRANSPORT: form-urlencoded only (application/json is WAF-blocked on this route).
+//   New model:  payload=<url-encoded JSON>   -> endpoint fetches template, fills,
+//               builds rows, computes ALL math, calls PDFShift, returns the PDF.
+//   Legacy:     html_content=<full HTML>      -> still supported (pre-filled HTML).
 //
-// Defaults are tuned for the BrokerOS template family (landscape 11x8.5 pages
-// authored at 1100x850px): landscape orientation + zoom 0.88, and an injected
-// pagination stylesheet so every broker's template breaks at its .page
-// boundaries. All are overridable per-request.
+// Contract: docs/BPO-PAYLOAD-SCHEMA.md  (OC sends raw data + prose only; the endpoint
+// is the sole authority on every derived value and all HTML assembly.)
 
-// Pagination safety-net CSS (Option B): forces each .page onto its own physical
-// page for ANY template using the house .page / .page-wrapper convention.
-// Injected last (before </head>) so it overrides the template's own rules.
+// ---- Per-broker registry (identity + branding + template) -------------------
+const BROKERS = {
+  eagen: {
+    name: 'Jessie Eagen',
+    phone: '406.542.1811',
+    email: 'jessie@jessieeagen.com',
+    template_url: 'https://raw.githubusercontent.com/JoeKal97/brokeros-config/main/brokeros-template.html',
+    branding: {
+      primary_color: '#E8702A',
+      secondary_color: '#000000',
+      heading_font: 'Playfair Display',
+      body_font: 'Barlow'
+    }
+  }
+};
+
+const PUBLIC_FUNDING_DEFAULT =
+  'Eligibility for public incentive programs should be verified with the City of Missoula Planning Department.';
+
 const PAGINATION_CSS =
   '<style id="brokeros-pagination-fix">' +
   '.page-wrapper{display:block;padding:0;}' +
@@ -22,127 +36,259 @@ const PAGINATION_CSS =
   '.page:last-child{break-after:auto;page-break-after:auto;}' +
   '</style>';
 
+// ---- Formatting + math helpers (endpoint is the authority) ------------------
+const DASH = '\u2014';
+const isNum = (n) => typeof n === 'number' && isFinite(n);
+const esc = (s) => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const money = (n) => isNum(n) ? '$' + Math.round(n).toLocaleString('en-US') : DASH;
+const psf   = (n) => isNum(n) ? '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : DASH;
+const sfNum = (n) => isNum(n) ? Math.round(n).toLocaleString('en-US') : DASH;
+const sfUnit= (n) => isNum(n) ? Math.round(n).toLocaleString('en-US') + ' SF' : DASH;
+const pct   = (n, dp = 1) => isNum(n) ? n.toFixed(dp) + '%' : DASH;
+const intf  = (n) => isNum(n) ? Math.round(n).toLocaleString('en-US') : DASH;
+const MON_S = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const MON_L = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+function dateFmt(iso, short = false) {
+  if (!iso) return DASH;
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return esc(iso);
+  return (short ? MON_S : MON_L)[d.getUTCMonth()] + ' ' + d.getUTCDate() + ', ' + d.getUTCFullYear();
+}
+const num = (v) => isNum(v) ? v : null;
+const perSf = (v, bldg) => (isNum(v) && isNum(bldg) && bldg > 0) ? v / bldg : null;
+
+// ---- Row builders (Bucket 2) ------------------------------------------------
+function buildRentRoll(tenants, building_sf) {
+  const list = Array.isArray(tenants) ? tenants : [];
+  let rows = '';
+  let totSf = 0, totAnnual = 0, totMarket = 0, anyMarket = false, n = 0;
+  for (const t of list) {
+    const size = num(t.size_sf), annual = num(t.annual_rent), mkt = num(t.market_rent);
+    const share = (isNum(size) && isNum(building_sf) && building_sf > 0) ? size / building_sf * 100 : null;
+    const mktPsf = (isNum(mkt) && isNum(size) && size > 0) ? mkt / size : null;
+    rows +=
+      '<tr>' +
+      '<td>' + esc(t.suite) + '</td>' +
+      '<td>' + esc(t.name) + '</td>' +
+      '<td class="right">' + sfNum(size) + '</td>' +
+      '<td class="right">' + pct(share, 1) + '</td>' +
+      '<td class="right">' + psf(num(t.rent_psf)) + '</td>' +
+      '<td class="right">' + money(mkt) + '</td>' +
+      '<td class="right">' + psf(mktPsf) + '</td>' +
+      '<td class="right">' + money(annual) + '</td>' +
+      '<td class="right">' + dateFmt(t.lease_start, true) + '</td>' +
+      '<td class="right">' + dateFmt(t.lease_end, true) + '</td>' +
+      '</tr>';
+    if (isNum(size)) totSf += size;
+    if (isNum(annual)) totAnnual += annual;
+    if (isNum(mkt)) { totMarket += mkt; anyMarket = true; }
+    n++;
+  }
+  const totShare = (isNum(building_sf) && building_sf > 0) ? totSf / building_sf * 100 : null;
+  const avgSf = n ? totSf / n : null;
+  const avgShare = (n && isNum(totShare)) ? totShare / n : null;
+  const avgPsf = (totSf > 0) ? totAnnual / totSf : null;
+  const avgAnnual = n ? totAnnual / n : null;
+  return {
+    RENT_ROLL_ROWS: rows,
+    RR_TOTAL_SF: sfNum(totSf || null), RR_TOTAL_PCT: pct(totShare, 1), RR_TOTAL_PSF: DASH,
+    RR_TOTAL_MKT: anyMarket ? money(totMarket) : DASH, RR_TOTAL_MKTSF: DASH,
+    RR_TOTAL_ANNUAL: money(totAnnual || null),
+    RR_AVG_SF: sfNum(avgSf), RR_AVG_PCT: pct(avgShare, 1), RR_AVG_PSF: psf(avgPsf),
+    RR_AVG_MKT: DASH, RR_AVG_MKTSF: DASH, RR_AVG_ANNUAL: money(avgAnnual)
+  };
+}
+
+function statusBadge(status) {
+  const map = {
+    sold: ['sold', 'Sold'], on_market: ['on-market', 'On Market'], 'on-market': ['on-market', 'On Market'],
+    active: ['on-market', 'On Market'], contract: ['contract', 'Under Contract'],
+    under_contract: ['contract', 'Under Contract']
+  };
+  return map[String(status || '').toLowerCase()] || ['sold', 'Sale Comp'];
+}
+
+function compBlock(c, idx) {
+  const [cls, label] = statusBadge(c.status);
+  const photo = c.photo_url
+    ? '<div class="comp-photo"><img src="' + esc(c.photo_url) + '" alt="comp" /></div>'
+    : '<div class="comp-photo"><div class="comp-photo-ph">Comp Photo</div></div>';
+  return (
+    '<div class="comp-row">' +
+    '<div class="comp-num">' + idx + '</div>' +
+    photo +
+    '<div class="comp-info">' +
+    '<div class="comp-name">' + esc(c.address) + '</div>' +
+    '<div class="comp-address-text">' + esc(c.city_state) + '</div>' +
+    '<span class="comp-badge ' + cls + '">' + esc(label) + '</span>' +
+    '<div class="comp-specs">' +
+    '<div class="comp-spec-item">Price: <span>' + money(num(c.price)) + '</span></div>' +
+    '<div class="comp-spec-item">Bldg Size: <span>' + sfUnit(num(c.building_sf)) + '</span></div>' +
+    '<div class="comp-spec-item">Lot Size: <span>' + sfUnit(num(c.lot_sf)) + '</span></div>' +
+    '<div class="comp-spec-item">No. Units: <span>' + intf(num(c.units)) + '</span></div>' +
+    '<div class="comp-spec-item">Cap Rate: <span>' + pct(num(c.cap_rate), 2) + '</span></div>' +
+    '<div class="comp-spec-item">Year Built: <span>' + intf(num(c.year_built)) + '</span></div>' +
+    '</div></div><div class="comp-mini-map"></div></div>'
+  );
+}
+
+function buildComps(comps) {
+  const list = Array.isArray(comps) ? comps.slice(0, 6) : [];
+  const out = {};
+  for (let i = 0; i < 6; i++) out['COMP_' + (i + 1) + '_ROW'] = list[i] ? compBlock(list[i], i + 1) : '';
+  let summary = '', sp = 0, sb = 0, sl = 0, np = 0, nb = 0, nl = 0;
+  for (const c of list) {
+    summary +=
+      '<tr><td>' + esc(c.address) + (c.city_state ? ', ' + esc(c.city_state) : '') + '</td>' +
+      '<td>' + money(num(c.price)) + '</td><td>' + sfNum(num(c.building_sf)) + '</td>' +
+      '<td>' + sfNum(num(c.lot_sf)) + '</td><td>' + intf(num(c.units)) + '</td>' +
+      '<td>' + pct(num(c.cap_rate), 2) + '</td></tr>';
+    if (isNum(c.price)) { sp += c.price; np++; }
+    if (isNum(c.building_sf)) { sb += c.building_sf; nb++; }
+    if (isNum(c.lot_sf)) { sl += c.lot_sf; nl++; }
+  }
+  out.COMPS_SUMMARY_ROWS = summary;
+  out.COMP_AVG_PRICE = np ? money(sp / np) : DASH;
+  out.COMP_AVG_BLDG = nb ? sfNum(sb / nb) : DASH;
+  out.COMP_AVG_LOT = nl ? sfNum(sl / nl) : DASH;
+  return out;
+}
+
+// ---- Build the full {{VARIABLE}} map from the payload -----------------------
+function buildVars(payload, broker) {
+  const s = payload.subject || {};
+  const nar = payload.narratives || {};
+  const building_sf = num(s.building_sf);
+  const asking = num(s.asking_price);
+  const list = isNum(num(s.list_price)) ? num(s.list_price) : asking;
+  const noi = num(s.noi);
+  const capRate = (isNum(noi) && isNum(asking) && asking > 0) ? noi / asking * 100 : null;
+  const lot_sf = isNum(num(s.lot_sf)) ? num(s.lot_sf) : (isNum(num(s.acreage)) ? num(s.acreage) * 43560 : null);
+  const acreage = isNum(num(s.acreage)) ? num(s.acreage) : (isNum(num(s.lot_sf)) ? num(s.lot_sf) / 43560 : null);
+  const full_address = [s.address_line1, s.city_state_zip].filter(Boolean).map(esc).join(', ');
+  const considerations = Array.isArray(nar.value_considerations)
+    ? nar.value_considerations.map((x) => '<li>' + esc(x) + '</li>').join('')
+    : '';
+
+  const vars = {
+    PROPERTY_ADDRESS_LINE1: esc(s.address_line1), CITY_STATE_ZIP: esc(s.city_state_zip),
+    BROKER_NAME: esc(broker.name), BROKER_PHONE: esc(broker.phone), BROKER_EMAIL: esc(broker.email),
+    CLIENT_NAME: esc(s.client_name), FULL_ADDRESS: full_address, MARKET_NAME: esc(s.market_name),
+    ASSET_TYPE: esc(s.asset_type), BUILDING_SF: sfNum(building_sf),
+    ACREAGE: isNum(acreage) ? acreage.toFixed(2) : DASH, TOUR_DATE: dateFmt(s.tour_date || new Date().toISOString()),
+    VALUE_LOW: money(num(s.value_low)), VALUE_HIGH: money(num(s.value_high)),
+    VALUE_LOW_PSF: psf(perSf(num(s.value_low), building_sf)), VALUE_HIGH_PSF: psf(perSf(num(s.value_high), building_sf)),
+    LIST_PRICE: money(list), LIST_PRICE_PSF: psf(perSf(list, building_sf)),
+    MARKET_DURATION: esc(s.market_duration),
+    TARGET_BUYER_NARRATIVE: esc(nar.target_buyer), VALUE_CONSIDERATIONS_LIST: considerations,
+    HIGHEST_BEST_USE: esc(nar.highest_best_use), OPTIMAL_BUYER: esc(nar.optimal_buyer),
+    RISKS_CONSIDERATIONS: esc(nar.risks), MARKET_OUTLOOK: esc(nar.market_outlook),
+    COMP_OVERVIEW_1: esc(nar.comp_overview_1), COMP_OVERVIEW_2: esc(nar.comp_overview_2),
+    PUBLIC_FUNDING: nar.public_funding ? esc(nar.public_funding) : PUBLIC_FUNDING_DEFAULT,
+    FINANCING_OUTLOOK: esc(nar.financing_outlook),
+    PROPERTY_ENTITY_NAME: esc(s.address_line1),
+    FIN_PRICE: money(asking), FIN_PRICE_PSF: psf(perSf(asking, building_sf)),
+    FIN_CAP_RATE: pct(capRate, 2), FIN_TOTAL_RETURN: money(noi), FIN_OPEX: money(num(s.opex)), FIN_NOI: money(noi),
+    SUBJECT_ADDRESS: esc(s.address_line1), SUBJECT_CITY_STATE: esc(s.city_state_zip),
+    SUBJECT_PRICE: money(asking), SUBJECT_BLDG_SF: sfUnit(building_sf), SUBJECT_LOT_SF: sfUnit(lot_sf),
+    SUBJECT_UNITS: intf(num(s.units)), SUBJECT_CAP: pct(capRate, 2), SUBJECT_YEAR: intf(num(s.year_built)),
+    DEMOGRAPHICS_ROWS: "<tr><td colspan='4'>Demographic data available upon request.</td></tr>",
+    POPULATION_ROWS: "<tr><td colspan='4'>Population data available upon request.</td></tr>",
+    HOUSEHOLD_ROWS: "<tr><td colspan='4'>Household &amp; income data available upon request.</td></tr>"
+  };
+  Object.assign(vars, buildRentRoll(payload.tenants, building_sf));
+  Object.assign(vars, buildComps(payload.comps));
+  return vars;
+}
+
+function fillTemplate(tpl, vars) {
+  let out = tpl;
+  for (const k of Object.keys(vars)) {
+    out = out.split('{{' + k + '}}').join(vars[k] == null ? '' : String(vars[k]));
+  }
+  out = out.replace(/\{\{[A-Z0-9_]+\}\}/g, '');
+  return out;
+}
+
 export default async function handler(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  // Only allow POST
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
-
-  // Pull API key from environment — never hardcode
   const apiKey = process.env.PDFSHIFT_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ error: 'PDF service not configured' });
-  }
+  if (!apiKey) return res.status(500).json({ error: 'PDF service not configured' });
 
-  // Extract payload from OC
-  const { html_content, property_address, broker_id } = req.body || {};
-
-  // --- BOM / leading-whitespace guard --------------------------------------
-  // PDFShift rejects a source that doesn't START with <!DOCTYPE / <html /
-  // http(s); a stray BOM or newline silently breaks it.
-  let source = (html_content || '').replace(/^\uFEFF/, '').trimStart();
-
-  if (!source) {
-    return res.status(400).json({ error: 'No HTML content provided' });
-  }
-
-  // --- Prefix validation ----------------------------------------------------
-  if (!/^(<!doctype|<html|https?:\/\/)/i.test(source)) {
-    return res.status(400).json({
-      error: 'Invalid HTML',
-      detail: 'html_content must start with "<!DOCTYPE", "<html", or "http(s)://". '
-            + 'Check for stray leading text, BOM, or chat/log prefixes.'
-    });
-  }
-
-  // --- Pagination injection (Option B; default on) -------------------------
-  // Insert the safety-net CSS so .page divs break at their boundaries even if a
-  // template forgets the rules. Opt out with paginate=false.
-  const injectPagination = !(req.body.paginate === false || req.body.paginate === 'false');
-  if (injectPagination) {
-    if (/<\/head>/i.test(source)) {
-      source = source.replace(/<\/head>/i, PAGINATION_CSS + '</head>');
-    } else if (/<\/body>/i.test(source)) {
-      source = source.replace(/<\/body>/i, PAGINATION_CSS + '</body>');
-    } else {
-      source = source + PAGINATION_CSS;
-    }
-  }
-
-  // --- Layout controls (per-request; defaults tuned for the template) ------
-  // landscape: DEFAULT TRUE. The BrokerOS templates author pages at 1100x850px
-  //   (= Letter LANDSCAPE, 11x8.5in). Send landscape=false to override.
-  // zoom: DEFAULT 0.88. Absorbs the 100px/in design vs 96px/in render oversize,
-  //   fits 1100x850 within Letter-landscape with margins, and keeps each .page
-  //   under one physical page (above ~0.92 a page can overflow). Range 0.1-2.
-  // margin: page margin; '0' lets the design's own padding + zoom set the margins.
-  const landscape = (req.body.landscape === false || req.body.landscape === 'false')
-    ? false
-    : true;
-
-  const zoomRaw = parseFloat(req.body.zoom);
-  const zoom = (!isNaN(zoomRaw) && zoomRaw >= 0.1 && zoomRaw <= 2) ? zoomRaw : 0.88;
-
-  const margin = (req.body.margin !== undefined && req.body.margin !== '')
-    ? req.body.margin
-    : '0';
+  const body = req.body || {};
+  let source = null;
+  let filenameSeed = body.property_address || 'bpo-document';
+  let options = {};
 
   try {
-    // Call PDFShift API
+    if (body.payload !== undefined && body.payload !== '') {
+      let payload;
+      try { payload = JSON.parse(body.payload); }
+      catch { return res.status(400).json({ error: 'Invalid payload', detail: 'payload must be a URL-encoded JSON string' }); }
+
+      const broker = BROKERS[payload.broker_id];
+      if (!broker) return res.status(400).json({ error: 'Unknown broker_id', detail: String(payload.broker_id) });
+
+      const tplResp = await fetch(broker.template_url);
+      if (!tplResp.ok) return res.status(502).json({ error: 'Template fetch failed', detail: 'HTTP ' + tplResp.status });
+      const tpl = await tplResp.text();
+
+      const vars = buildVars(payload, broker);
+      source = fillTemplate(tpl, vars);
+      filenameSeed = (payload.subject && payload.subject.address_line1) || 'bpo-document';
+      options = payload.options || {};
+    } else if (body.html_content !== undefined) {
+      source = String(body.html_content);
+    } else {
+      return res.status(400).json({ error: 'No payload or html_content provided' });
+    }
+
+    source = source.replace(/^\uFEFF/, '').trimStart();
+    if (!/^(<!doctype|<html|https?:\/\/)/i.test(source)) {
+      return res.status(400).json({ error: 'Invalid HTML', detail: 'Rendered source must start with <!DOCTYPE or <html.' });
+    }
+    if (/<\/head>/i.test(source)) source = source.replace(/<\/head>/i, PAGINATION_CSS + '</head>');
+    else if (/<\/body>/i.test(source)) source = source.replace(/<\/body>/i, PAGINATION_CSS + '</body>');
+    else source = source + PAGINATION_CSS;
+
+    const lsRaw = options.landscape !== undefined ? options.landscape : body.landscape;
+    const landscape = (lsRaw === false || lsRaw === 'false') ? false : true;
+    const zRaw = parseFloat(options.zoom !== undefined ? options.zoom : body.zoom);
+    const zoom = (!isNaN(zRaw) && zRaw >= 0.1 && zRaw <= 2) ? zRaw : 0.88;
+    const margin = (options.margin !== undefined && options.margin !== '') ? options.margin
+                 : (body.margin !== undefined && body.margin !== '') ? body.margin : '0';
+
     const pdfResponse = await fetch('https://api.pdfshift.io/v3/convert/pdf', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': 'Basic ' + Buffer.from('api:' + apiKey).toString('base64'),
+        'Authorization': 'Basic ' + Buffer.from('api:' + apiKey).toString('base64')
       },
-      body: JSON.stringify({
-        source: source,
-        landscape: landscape,
-        zoom: zoom,
-        format: 'Letter',
-        margin: margin,
-        delay: 500,                // wait 500ms for fonts to load (PDFShift v3 param)
-      }),
+      body: JSON.stringify({ source, landscape, zoom, format: 'Letter', margin, delay: 500 })
     });
 
     if (!pdfResponse.ok) {
       const errorText = await pdfResponse.text();
       console.error('PDFShift error:', errorText);
-      return res.status(500).json({
-        error: 'PDF generation failed',
-        detail: errorText
-      });
+      return res.status(500).json({ error: 'PDF generation failed', detail: errorText });
     }
 
-    // PDFShift returns the PDF as binary — get it as a buffer
     const pdfBuffer = await pdfResponse.arrayBuffer();
-
-    // Return PDF directly as download
-    const filename = sanitizeFilename(property_address) + '.pdf';
-
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(filenameSeed)}.pdf"`);
     res.setHeader('Content-Length', pdfBuffer.byteLength);
-
     return res.send(Buffer.from(pdfBuffer));
 
   } catch (error) {
     console.error('Endpoint error:', error);
-    return res.status(500).json({
-      error: 'Something went wrong',
-      message: error.message
-    });
+    return res.status(500).json({ error: 'Something went wrong', message: error.message });
   }
 }
 
-// Clean up address for use as filename
 function sanitizeFilename(address) {
   if (!address) return 'bpo-document';
-  return 'bpo-' + address
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, '')   // Remove special chars
-    .replace(/\s+/g, '-')            // Spaces to hyphens
-    .replace(/-+/g, '-')             // Collapse multiple hyphens
-    .substring(0, 60);               // Max 60 chars
+  return 'bpo-' + address.toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').substring(0, 60);
 }
