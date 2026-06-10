@@ -1,27 +1,49 @@
 // /api/telegram-webhook.js
-// BrokerOS — Telegram bridge, INCREMENT 1 of 3: bare echo bridge.
+// BrokerOS — Telegram bridge, INCREMENT 2 of 3: single-turn Managed Agent handoff.
 //
-// Proves the loop: Telegram update -> Vercel webhook -> this code -> reply via Telegram.
-// NO Managed Agent, NO session state yet (those are Increments 2 & 3). Just echo + the
-// message-TYPE routing we provision from day one (L5 bridge spec): text is echoed,
-// voice/document/photo/etc. get a "not handled yet" stub so the router exists up front.
+// Text messages are no longer echoed — they are handed to the persisted BrokerOS Managed
+// Agent and the agent's reply is sent back to the chat. NO multi-turn session state yet
+// (Increment 3 = Supabase session mapping); for now EACH message is one independent,
+// single-turn agent call (fresh session, ephemeral). Non-text messages keep their stubs.
 //
-// TRANSPORT: Telegram POSTs application/json. Vercel's Node runtime parses it into
-// req.body automatically (we also defensively JSON.parse a string body). We always return
-// 200 quickly — Telegram retries the update on any non-2xx.
+// TIMEOUT HANDLING (the key design point):
+//   Telegram expects a fast webhook response and retries the update on a slow/non-2xx
+//   reply — which would cause duplicate agent runs and duplicate Telegram messages. An
+//   agent call (provision cloud environment + session + poll to idle) is far too slow to
+//   block on. So we:
+//     1. Respond 200 to Telegram IMMEDIATELY (before the agent call).
+//     2. Run the agent call in the background via Vercel `waitUntil`, then deliver the
+//        agent's answer with a FOLLOW-UP sendMessage.
+//   The webhook never blocks on the agent, so Telegram never retries and the user never
+//   gets duplicates. The background work is bounded by the function maxDuration (below).
 //
-// CONFIG: TELEGRAM_BOT_TOKEN must be set in the Vercel project env (server-side only;
-// never shipped to the client, never logged here).
+// LATENCY: the slow part is cloud-environment provisioning. We cache the environment id in
+// module scope so warm function instances reuse it across messages (only cold starts pay
+// the full provisioning cost); a stale/archived env is detected and recreated once.
 //
-// setWebhook (re-run after a domain change; token redacted):
-//   curl -s "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://brokeros-config.vercel.app/api/telegram-webhook"
+// CONFIG (Vercel env, server-side only, never logged here):
+//   TELEGRAM_BOT_TOKEN  — bot token for sendMessage
+//   ANTHROPIC_API_KEY   — read by the Anthropic SDK (x-api-key) for the agent call
+//   BROKEROS_AGENT_ID   — optional override of the persisted agent id
 
-const VERSION = '2026-06-10-tg-1';
+import Anthropic from '@anthropic-ai/sdk';
+import { waitUntil } from '@vercel/functions';
 
+// Background agent work needs room beyond the (immediate) webhook 200. 60s is safe on all
+// Vercel plans; bump to 300 (Pro) if cold-start agent replies don't arrive in time.
+export const config = { maxDuration: 60 };
+
+const VERSION = '2026-06-10-tg-2';
+
+// Persisted BrokerOS agent (governed by agents/brokeros-bpo-system-prompt.md, baked into
+// the agent at create time). Overridable via env if the agent is rebuilt.
+const AGENT_ID = process.env.BROKEROS_AGENT_ID || 'agent_01DDa6SH2GfP2AgdhpRmZgZg';
+
+const TERMINAL = new Set(['session.status_idle', 'session.status_terminated', 'session.error']);
 const TG_API = (token, method) => `https://api.telegram.org/bot${token}/${method}`;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Detect the inbound message type. Only 'text' is handled this increment; everything else
-// is recognized and stubbed so the routing is real from day one (not text-only hardcoded).
+// ---- message-type routing (unchanged from Increment 1) ----
 function classify(msg) {
   if (!msg) return 'none';
   if (typeof msg.text === 'string') return 'text';
@@ -38,60 +60,122 @@ function classify(msg) {
 }
 
 async function sendMessage(token, chatId, text) {
+  // Telegram caps a message at 4096 chars; trim defensively.
+  const body = { chat_id: chatId, text: String(text).slice(0, 4096) };
   const resp = await fetch(TG_API(token, 'sendMessage'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify(body),
   });
-  // Telegram returns {ok:true,...} or {ok:false,description}. Surface failures in the
-  // function response body (NOT the token) for debugging via Vercel logs.
   let info = null;
   try { info = await resp.json(); } catch { /* ignore */ }
   return { status: resp.status, ok: info ? info.ok : false, description: info ? info.description : null };
 }
 
+// Defensive: if the agent wraps its whole reply in a ```fence``` (e.g. PAYLOAD_READY JSON),
+// unwrap it so the chat shows clean text rather than raw backticks. Plain prose passes through.
+function unwrapFence(text) {
+  const t = String(text || '').trim();
+  const m = t.match(/^```(?:json|JSON)?\s*([\s\S]*?)\s*```$/);
+  return m ? m[1].trim() : t;
+}
+
+// ---- single-turn Managed Agent call ----
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+let cachedEnvId = null; // reused across warm invocations
+
+async function ensureEnv() {
+  if (cachedEnvId) return cachedEnvId;
+  const env = await anthropic.beta.environments.create({ name: 'bpo-tg-env', config: { type: 'cloud' } });
+  cachedEnvId = env.id;
+  return cachedEnvId;
+}
+
+async function createSessionWithEnv() {
+  // Try the cached env; if it's stale/archived, recreate once.
+  try {
+    const envId = await ensureEnv();
+    return await anthropic.beta.sessions.create({ agent: AGENT_ID, environment_id: envId });
+  } catch (e) {
+    cachedEnvId = null;
+    const envId = await ensureEnv();
+    return await anthropic.beta.sessions.create({ agent: AGENT_ID, environment_id: envId });
+  }
+}
+
+async function runAgentSingleTurn(text, deadlineMs) {
+  let session = null;
+  try {
+    session = await createSessionWithEnv();
+    await anthropic.beta.sessions.events.send(session.id, {
+      events: [{ type: 'user.message', content: [{ type: 'text', text }] }],
+    });
+    let reply = '';
+    while (Date.now() < deadlineMs) {
+      const evs = [];
+      for await (const e of anthropic.beta.sessions.events.list(session.id, { order: 'asc' })) evs.push(e);
+      if (evs.some((e) => TERMINAL.has(e.type))) {
+        reply = evs
+          .filter((e) => e.type === 'agent.message')
+          .flatMap((e) => (e.content || []).map((b) => b.text || ''))
+          .join('')
+          .trim();
+        break;
+      }
+      await sleep(2500);
+    }
+    return reply;
+  } finally {
+    // Session is ephemeral (single-turn). Keep the env cached for reuse; drop the session.
+    try { if (session) await anthropic.beta.sessions.delete(session.id); } catch { /* ignore */ }
+  }
+}
+
 export default async function handler(req, res) {
-  // VERSION marker (same convention as generate-pdf / parse-rentroll).
   if (req.method === 'GET' || (req.query && req.query.version !== undefined)) {
-    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 1 });
+    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 2 });
   }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const token = process.env.TELEGRAM_BOT_TOKEN;
 
-  // Parse the Telegram update defensively (object when Vercel parsed it; string otherwise).
   let update = req.body;
-  if (typeof update === 'string') {
-    try { update = JSON.parse(update); } catch { update = {}; }
-  }
+  if (typeof update === 'string') { try { update = JSON.parse(update); } catch { update = {}; } }
   update = update || {};
 
-  // A Telegram update may carry the message under several keys; handle the common ones.
   const msg = update.message || update.edited_message || update.channel_post || null;
   const type = classify(msg);
 
-  // No actionable message (e.g. my_chat_member, callback_query, etc.) — ack and move on.
   if (!msg || !msg.chat) {
     return res.status(200).json({ ok: true, version: VERSION, handled: 'no-message', type });
   }
-
   const chatId = msg.chat.id;
-  const reply = type === 'text'
-    ? `echo: ${msg.text}`
-    : `received a ${type} — not handled yet`;
 
-  // No token configured: still 200 so Telegram doesn't retry-storm; report config gap.
   if (!token) {
     return res.status(200).json({ ok: true, version: VERSION, type, sent: false, reason: 'TELEGRAM_BOT_TOKEN not set in Vercel env' });
   }
 
-  let send = { status: 0, ok: false, description: 'send not attempted' };
-  try {
-    send = await sendMessage(token, chatId, reply);
-  } catch (e) {
-    send = { status: 0, ok: false, description: String(e && e.message || e) };
+  // Non-text: fast stub reply (Increment 1 behavior), awaited (quick) then 200.
+  if (type !== 'text') {
+    let send = { ok: false };
+    try { send = await sendMessage(token, chatId, `received a ${type} — not handled yet`); } catch { /* ignore */ }
+    return res.status(200).json({ ok: true, version: VERSION, type, reply_sent: send.ok });
   }
 
-  // Always 200 to Telegram (retries only on non-2xx); echo diagnostics in the body.
-  return res.status(200).json({ ok: true, version: VERSION, type, reply_sent: send.ok, tg_status: send.status, tg_error: send.description });
+  // TEXT: answer fast to Telegram, run the agent in the background, deliver as a follow-up.
+  res.status(200).json({ ok: true, version: VERSION, type, mode: 'agent-async' });
+
+  const incoming = msg.text;
+  waitUntil((async () => {
+    try {
+      // Leave headroom under maxDuration (60s) for teardown + the follow-up sendMessage.
+      const deadline = Date.now() + 50000;
+      let reply = await runAgentSingleTurn(incoming, deadline);
+      reply = unwrapFence(reply);
+      if (!reply) reply = "Sorry — I couldn't get a reply from the agent in time. Please try again.";
+      await sendMessage(token, chatId, reply);
+    } catch (e) {
+      try { await sendMessage(token, chatId, '⚠️ Agent error — please try again.'); } catch { /* ignore */ }
+    }
+  })());
 }
