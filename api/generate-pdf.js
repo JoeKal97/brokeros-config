@@ -11,7 +11,7 @@
 // is the sole authority on every derived value and all HTML assembly.)
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-09b';
+const VERSION = '2026-06-09c';
 
 // ---- Per-broker registry (identity + branding + template) -------------------
 const BROKERS = {
@@ -50,6 +50,7 @@ const sfNum = (n) => isNum(n) ? Math.round(n).toLocaleString('en-US') : DASH;
 const sfUnit= (n) => isNum(n) ? Math.round(n).toLocaleString('en-US') + ' SF' : DASH;
 const pct   = (n, dp = 1) => isNum(n) ? n.toFixed(dp) + '%' : DASH;
 const intf  = (n) => isNum(n) ? Math.round(n).toLocaleString('en-US') : DASH;
+const yearf = (n) => isNum(n) ? String(Math.round(n)) : DASH;  // A7: years must NOT be thousands-formatted (1968, not 1,968)
 const MON_S = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const MON_L = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 function dateFmt(iso, short = false) {
@@ -138,7 +139,7 @@ function compBlock(c, idx) {
     '<div class="comp-spec-item">Lot Size: <span>' + sfUnit(num(c.lot_sf)) + '</span></div>' +
     '<div class="comp-spec-item">No. Units: <span>' + intf(num(c.units)) + '</span></div>' +
     '<div class="comp-spec-item">Cap Rate: <span>' + pct(num(c.cap_rate), 2) + '</span></div>' +
-    '<div class="comp-spec-item">Year Built: <span>' + intf(num(c.year_built)) + '</span></div>' +
+    '<div class="comp-spec-item">Year Built: <span>' + yearf(num(c.year_built)) + '</span></div>' +
     '</div></div><div class="comp-mini-map"></div></div>'
   );
 }
@@ -202,7 +203,7 @@ function buildVars(payload, broker) {
     FIN_CAP_RATE: pct(capRate, 2), FIN_TOTAL_RETURN: money(noi), FIN_OPEX: money(num(s.opex)), FIN_NOI: money(noi),
     SUBJECT_ADDRESS: esc(s.address_line1), SUBJECT_CITY_STATE: esc(s.city_state_zip),
     SUBJECT_PRICE: money(asking), SUBJECT_BLDG_SF: sfUnit(building_sf), SUBJECT_LOT_SF: sfUnit(lot_sf),
-    SUBJECT_UNITS: intf(num(s.units)), SUBJECT_CAP: pct(capRate, 2), SUBJECT_YEAR: intf(num(s.year_built)),
+    SUBJECT_UNITS: intf(num(s.units)), SUBJECT_CAP: pct(capRate, 2), SUBJECT_YEAR: yearf(num(s.year_built)),
     DEMOGRAPHICS_ROWS: "<tr><td colspan='4'>Demographic data available upon request.</td></tr>",
     POPULATION_ROWS: "<tr><td colspan='4'>Population data available upon request.</td></tr>",
     HOUSEHOLD_ROWS: "<tr><td colspan='4'>Household &amp; income data available upon request.</td></tr>"
