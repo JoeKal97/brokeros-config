@@ -33,10 +33,15 @@ import Anthropic from '@anthropic-ai/sdk';
 import { waitUntil } from '@vercel/functions';
 
 // The generate turn (agent writes the full payload, then PDFShift renders 19 pages) is the
-// heaviest. 60s is safe on every Vercel plan; bump to 300 (Pro) for more headroom.
-export const config = { maxDuration: 60 };
+// heaviest (full payload + 19-page PDFShift render). 300s (Vercel Pro) gives the generate
+// turn ample headroom so it never times out from the broker's view.
+export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-10-tg-3';
+const VERSION = '2026-06-10-tg-4';
+
+// A chat marked "generating" within this window blocks a second generation (double-gen
+// guard). Beyond it the mark is treated as stale (a truly dead run) and generation may retry.
+const GENERATING_TTL_MS = 240000;
 
 // Rebuilt agent governed by base workflow + agents/telegram-delivery-contract.md.
 const AGENT_ID = process.env.BROKEROS_AGENT_ID || 'agent_01P5UgeExc512tsiW8ePCcyR';
@@ -86,6 +91,22 @@ async function sendDocument(token, chatId, bytes, filename) {
   return info ? !!info.ok : resp.ok;
 }
 
+// "typing" chat action (broker sees the bot is active). Expires ~5s, so we pulse it.
+async function sendChatAction(token, chatId, action = 'typing') {
+  try {
+    await fetch(TG_API(token, 'sendChatAction'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, action }),
+    });
+  } catch { /* ignore */ }
+}
+// Start a background "typing" pulse; returns a stopper. Re-sends every 4s for long turns.
+function startTyping(token, chatId) {
+  let active = true;
+  (async () => { while (active) { await sendChatAction(token, chatId, 'typing'); await sleep(4000); } })();
+  return () => { active = false; };
+}
+
 // ---- Supabase session mapping (PostgREST + service key) ----
 const SB_URL = process.env.SUPABASE_URL;
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -113,6 +134,21 @@ async function sbTouch(chatId) {
 }
 async function sbDelete(chatId) {
   await fetch(`${SB_URL}/rest/v1/telegram_sessions?telegram_chat_id=eq.${chatId}`, { method: 'DELETE', headers: { ...sbHeaders(), Prefer: 'return=minimal' } });
+}
+// Double-generation guard state (requires status + generating_since columns; degrades to
+// no-guard if the ALTER TABLE hasn't been run — the PATCH simply no-ops on unknown columns).
+async function sbSetGenerating(chatId, on) {
+  await fetch(`${SB_URL}/rest/v1/telegram_sessions?telegram_chat_id=eq.${chatId}`, {
+    method: 'PATCH', headers: { ...sbHeaders(), Prefer: 'return=minimal' },
+    body: JSON.stringify(on
+      ? { status: 'generating', generating_since: new Date().toISOString() }
+      : { status: null, generating_since: null }),
+  });
+}
+function isGeneratingActive(row) {
+  if (!row || row.status !== 'generating') return false;
+  const since = row.generating_since ? Date.parse(row.generating_since) : 0;
+  return Number.isFinite(since) && since > 0 && (Date.now() - since) < GENERATING_TTL_MS;
 }
 
 // ---- Managed Agent session ----
@@ -253,44 +289,65 @@ export default async function handler(req, res) {
 
       const wantStart = START_RE.test(incoming) || NEWBPO_RE.test(incoming);
       let row = await sbGet(chatId);
-      let sessionId;
 
-      if (wantStart || !row) {            // START: fresh session
-        const s = await newSession();
-        sessionId = s.id;
-        await sbUpsert(chatId, sessionId, s.envId);
-      } else {                            // REUSE: same stateful session = memory
-        sessionId = row.session_id;
-      }
-
-      // Bare "/start" or "/new" -> kick the agent's intake; otherwise pass the text through.
-      const toSend = /^\s*\/?(start|new)\s*$/i.test(incoming) ? 'Hi, I need to start a new BPO.' : incoming;
-
-      const deadline = Date.now() + 45000; // leave headroom under maxDuration for PDF + delivery
-      let reply;
-      try {
-        reply = await sendTurn(sessionId, toSend, deadline);
-      } catch (e) {
-        // Stored session/env was reclaimed — start a fresh session once and resend.
-        const s = await newSession();
-        sessionId = s.id;
-        await sbUpsert(chatId, sessionId, s.envId);
-        reply = await sendTurn(sessionId, toSend, deadline);
-      }
-
-      if (!reply) { await sendMessage(token, chatId, "Sorry — I couldn't get a reply in time. Please try again."); return; }
-
-      // Generation signal?
-      const payload = extractGenerate(reply);
-      if (payload) {
-        const ok = await generateAndDeliver(token, chatId, payload);
-        if (ok) await sbDelete(chatId);   // successful PDF ends the session
+      // DOUBLE-GENERATION GUARD: if a PDF is already being built for this chat, don't start
+      // a second generation (or even a second agent turn) — just reassure and return.
+      if (isGeneratingActive(row)) {
+        await sendMessage(token, chatId, 'Still building your BPO — one moment…');
         return;
       }
 
-      // Normal conversational turn.
-      await sbTouch(chatId);
-      await sendMessage(token, chatId, reply);
+      // Acknowledge immediately so the broker never wonders if it's working, then keep a
+      // "typing" indicator alive for the whole turn. (Acknowledgment only — no exposition.)
+      await sendMessage(token, chatId, 'Got it — working on that…');
+      const stopTyping = startTyping(token, chatId);
+      try {
+        let sessionId;
+        if (wantStart || !row) {            // START: fresh session
+          const s = await newSession();
+          sessionId = s.id;
+          await sbUpsert(chatId, sessionId, s.envId);
+        } else {                            // REUSE: same stateful session = memory
+          sessionId = row.session_id;
+        }
+
+        // Bare "/start" or "/new" -> kick the agent's intake; otherwise pass the text through.
+        const toSend = /^\s*\/?(start|new)\s*$/i.test(incoming) ? 'Hi, I need to start a new BPO.' : incoming;
+
+        const deadline = Date.now() + 200000; // generous; returns as soon as the agent is idle
+        let reply;
+        try {
+          reply = await sendTurn(sessionId, toSend, deadline);
+        } catch (e) {
+          // Stored session/env was reclaimed — start a fresh session once and resend.
+          const s = await newSession();
+          sessionId = s.id;
+          await sbUpsert(chatId, sessionId, s.envId);
+          reply = await sendTurn(sessionId, toSend, deadline);
+        }
+
+        if (!reply) { await sendMessage(token, chatId, "Sorry — I couldn't get a reply in time. Please try again."); return; }
+
+        // Generation signal?
+        const payload = extractGenerate(reply);
+        if (payload) {
+          await sbSetGenerating(chatId, true);     // mark before the heavy render -> blocks resends
+          let ok = false;
+          try {
+            ok = await generateAndDeliver(token, chatId, payload);
+          } finally {
+            if (ok) await sbDelete(chatId);          // successful PDF ends the session
+            else await sbSetGenerating(chatId, false); // failed -> clear the mark so retry is allowed
+          }
+          return;
+        }
+
+        // Normal conversational turn.
+        await sbTouch(chatId);
+        await sendMessage(token, chatId, reply);
+      } finally {
+        stopTyping();
+      }
     } catch (e) {
       try { await sendMessage(token, chatId, '⚠️ Something went wrong — please try again.'); } catch { /* ignore */ }
     }
