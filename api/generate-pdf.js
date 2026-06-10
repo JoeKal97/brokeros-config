@@ -10,6 +10,9 @@
 // Contract: docs/BPO-PAYLOAD-SCHEMA.md  (OC sends raw data + prose only; the endpoint
 // is the sole authority on every derived value and all HTML assembly.)
 
+// ---- Deploy marker (GET / ?version returns this) ---------------------------
+const VERSION = '2026-06-09a';
+
 // ---- Per-broker registry (identity + branding + template) -------------------
 const BROKERS = {
   eagen: {
@@ -212,6 +215,10 @@ function fillTemplate(tpl, vars) {
 }
 
 export default async function handler(req, res) {
+  // Deploy marker: GET (or ?version) returns the running version.
+  if (req.method === 'GET' || req.query && req.query.version !== undefined) {
+    return res.status(200).json({ version: VERSION });
+  }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const apiKey = process.env.PDFSHIFT_API_KEY;
