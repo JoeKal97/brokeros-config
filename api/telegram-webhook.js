@@ -178,6 +178,22 @@ async function generateAndDeliver(token, chatId, payload) {
 }
 
 export default async function handler(req, res) {
+  // Secret-safe Supabase round-trip self-test (GET ?selftest=supabase). Uses the server-side
+  // service key already in env (never returned); writes/reads/deletes a sentinel row to prove
+  // the telegram_sessions table is reachable before a full multi-turn phone test.
+  if (req.method === 'GET' && req.query && req.query.selftest === 'supabase') {
+    if (!sbConfigured()) return res.status(200).json({ selftest: 'supabase', ok: false, reason: 'SUPABASE_URL/SUPABASE_SERVICE_KEY not set' });
+    const sentinel = 999000999;
+    try {
+      await sbUpsert(sentinel, 'selftest-session', 'selftest-env');
+      const row = await sbGet(sentinel);
+      await sbDelete(sentinel);
+      const ok = !!(row && row.session_id === 'selftest-session');
+      return res.status(200).json({ selftest: 'supabase', ok, roundtrip: !!row });
+    } catch (e) {
+      return res.status(200).json({ selftest: 'supabase', ok: false, error: String((e && e.message) || e) });
+    }
+  }
   if (req.method === 'GET' || (req.query && req.query.version !== undefined)) {
     return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 3 });
   }
