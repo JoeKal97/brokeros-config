@@ -194,6 +194,19 @@ export default async function handler(req, res) {
       return res.status(200).json({ selftest: 'supabase', ok: false, error: String((e && e.message) || e) });
     }
   }
+  // Diagnostic: which agent does PROD actually resolve, and is it live? (agent_id/name are
+  // not secrets.) Proves env-override vs bundled-default and that it isn't the archived agent.
+  if (req.method === 'GET' && req.query && req.query.selftest === 'agent') {
+    const out = { selftest: 'agent', agent_id: AGENT_ID, source: process.env.BROKEROS_AGENT_ID ? 'env:BROKEROS_AGENT_ID' : 'bundled-default' };
+    try {
+      const a = await anthropic.beta.agents.retrieve(AGENT_ID);
+      out.name = a.name;
+      out.archived = !!a.archived_at;
+    } catch (e) {
+      out.retrieve_error = String((e && e.message) || e);
+    }
+    return res.status(200).json(out);
+  }
   if (req.method === 'GET' || (req.query && req.query.version !== undefined)) {
     return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 3 });
   }
