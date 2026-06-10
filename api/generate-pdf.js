@@ -11,7 +11,7 @@
 // is the sole authority on every derived value and all HTML assembly.)
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-09a';
+const VERSION = '2026-06-09b';
 
 // ---- Per-broker registry (identity + branding + template) -------------------
 const BROKERS = {
@@ -93,13 +93,20 @@ function buildRentRoll(tenants, building_sf) {
   const avgShare = (n && isNum(totShare)) ? totShare / n : null;
   const avgPsf = (totSf > 0) ? totAnnual / totSf : null;
   const avgAnnual = n ? totAnnual / n : null;
+  // A4: market-rent AVERAGES. RR_AVG_MKT = total market rent / number of tenants.
+  //     RR_AVG_MKTSF = WEIGHTED = total market rent / total SF (matches RR_AVG_PSF).
+  //     The per-SF TOTALS cells (RR_TOTAL_PSF, RR_TOTAL_MKTSF) stay blank by design.
+  const avgMarket = (anyMarket && n) ? totMarket / n : null;
+  const avgMktSf  = (anyMarket && totSf > 0) ? totMarket / totSf : null;
   return {
     RENT_ROLL_ROWS: rows,
     RR_TOTAL_SF: sfNum(totSf || null), RR_TOTAL_PCT: pct(totShare, 1), RR_TOTAL_PSF: DASH,
     RR_TOTAL_MKT: anyMarket ? money(totMarket) : DASH, RR_TOTAL_MKTSF: DASH,
     RR_TOTAL_ANNUAL: money(totAnnual || null),
     RR_AVG_SF: sfNum(avgSf), RR_AVG_PCT: pct(avgShare, 1), RR_AVG_PSF: psf(avgPsf),
-    RR_AVG_MKT: DASH, RR_AVG_MKTSF: DASH, RR_AVG_ANNUAL: money(avgAnnual)
+    RR_AVG_MKT: anyMarket ? money(avgMarket) : DASH,
+    RR_AVG_MKTSF: anyMarket ? psf(avgMktSf) : DASH,
+    RR_AVG_ANNUAL: money(avgAnnual)
   };
 }
 
