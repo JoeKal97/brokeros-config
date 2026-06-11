@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-11-tg-12';
+const VERSION = '2026-06-11-tg-12b';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -58,10 +58,20 @@ const GENERATING_TTL_MS = 240000;
 // A delivered BPO stays correctable (post-gen edits) only for this window after delivery/last
 // activity. After it, the session is closed; a new message starts fresh — so e.g. typing "BPO"
 // the next day begins a new BPO instead of resurfacing the old one.
-const DELIVERED_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const DELIVERED_TTL_MS = 2 * 60 * 1000; // TEMP 2 min for verification (restore to 6h after)
 function deliveredAgeMs(row) {
   const t = row && row.last_active ? Date.parse(row.last_active) : NaN;
   return Number.isFinite(t) ? Date.now() - t : Infinity; // missing timestamp => treat as expired
+}
+// Single source of truth for what an inbound message does relative to a (possibly delivered) row:
+//   'new'      -> start a fresh BPO  (bare "BPO" / "new BPO" / "start a BPO" / "/new")
+//   'closed'   -> correction to a delivered BPO past the window -> honest "session closed"
+//   'continue' -> edit a non-expired delivered BPO, or a normal in-progress turn
+function deliveredDecision(row, text) {
+  const wantStart = START_RE.test(text) || NEWBPO_RE.test(text);
+  if (wantStart) return 'new';
+  if (row && row.status === 'delivered' && deliveredAgeMs(row) > DELIVERED_TTL_MS) return 'closed';
+  return 'continue';
 }
 
 // Rebuilt agent governed by base workflow + agents/telegram-delivery-contract.md.
@@ -527,6 +537,22 @@ export default async function handler(req, res) {
       return res.status(200).json({ selftest: 'supabase', ok: false, error: String((e && e.message) || e) });
     }
   }
+  // TEMP diagnostic: delivered-session expiry decision for a synthesized row of a given age.
+  // Exercises the REAL deliveredDecision() + DELIVERED_TTL_MS + START_RE (removed after verify).
+  if (req.method === 'GET' && req.query && req.query.selftest === 'expiry') {
+    const ageSec = Number(req.query.age || 0);
+    const row = { status: 'delivered', session_id: 'test', last_payload: { x: 1 }, last_active: new Date(Date.now() - ageSec * 1000).toISOString() };
+    return res.status(200).json({
+      selftest: 'expiry',
+      ttl_ms: DELIVERED_TTL_MS,
+      row_age_ms: deliveredAgeMs(row),
+      decisions: {
+        'change the asking price to 1.6M': deliveredDecision(row, 'change the asking price to 1.6M'),
+        'BPO': deliveredDecision(row, 'BPO'),
+        'new BPO': deliveredDecision(row, 'new BPO'),
+      },
+    });
+  }
   // Diagnostic: latency breakdown of the most recent turn (ms from background start).
   if (req.method === 'GET' && req.query && req.query.selftest === 'timing') {
     return res.status(200).json({
@@ -675,8 +701,8 @@ export default async function handler(req, res) {
 
       // EXPIRY: a delivered BPO stays correctable only for DELIVERED_TTL. A non-start message
       // after that window is poking a long-closed BPO — close it and ask, rather than resurfacing
-      // stale state. (Bare "BPO" / "new BPO" / "start a BPO" are starts and skip this.)
-      if (!wantStart && row && row.status === 'delivered' && deliveredAgeMs(row) > DELIVERED_TTL_MS) {
+      // stale state. (Bare "BPO" / "new BPO" / "start a BPO" are 'new' and skip this.)
+      if (deliveredDecision(row, incoming) === 'closed') {
         await sbDelete(chatId);
         await sendMessage(token, chatId, "That BPO session has closed — want me to start a new one? Send \"new BPO\" and we’ll begin.");
         return;
