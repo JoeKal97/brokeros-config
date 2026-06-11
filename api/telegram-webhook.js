@@ -37,7 +37,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-10-tg-8';
+const VERSION = '2026-06-10-tg-9';
 
 // A chat marked "generating" within this window blocks a second generation (double-gen
 // guard). Beyond it the mark is treated as stale (a truly dead run) and generation may retry.
@@ -216,6 +216,7 @@ async function sbPatch(chatId, fields) {
 // without another agent round trip.
 const sbMarkGenerating = (chatId, payload) => sbPatch(chatId, { status: 'generating', generating_since: new Date().toISOString(), last_payload: payload });
 const sbMarkFailed = (chatId) => sbPatch(chatId, { status: 'generate_failed', generating_since: null }); // keep last_payload for retry
+const sbMarkDelivered = (chatId) => sbPatch(chatId, { status: 'delivered', generating_since: null }); // keep session + last_payload for post-delivery edits
 const sbClearState = (chatId) => sbPatch(chatId, { status: null, generating_since: null, last_payload: null });
 
 function isGeneratingActive(row) {
@@ -229,6 +230,7 @@ function isGeneratingActive(row) {
 async function answerStatus(token, chatId, row) {
   if (isGeneratingActive(row)) return sendMessage(token, chatId, 'Still building your BPO — about 30 seconds…');
   if (row && row.status === 'generate_failed') return sendMessage(token, chatId, "That last build didn’t go through — reply \"retry\" and I’ll finish it.");
+  if (row && row.status === 'delivered') return sendMessage(token, chatId, "Your BPO is delivered. Tell me any fix and I’ll update it, or say \"new BPO\" to start another.");
   if (row && row.session_id) return sendMessage(token, chatId, "I’m here — still on your BPO. Send the next detail whenever you’re ready.");
   return sendMessage(token, chatId, "I’m here. Send \"new BPO\" to start one.");
 }
@@ -307,8 +309,8 @@ async function runGeneration(token, chatId, payload) {
     const addr = (payload.subject && payload.subject.address_line1) || 'BPO';
     const fname = `Eagen_BPO_${String(addr).replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '')}.pdf`;
     if (await sendDocument(token, chatId, result.bytes, fname)) {  // attach FIRST
-      await sendMessage(token, chatId, '✅ Your BPO is ready.');     // THEN confirm — only after a real send
-      await sbDelete(chatId);                                       // success ends the session
+      await sendMessage(token, chatId, '✅ Your BPO is ready. Spot an error? Tell me the fix (e.g. “change the asking price to 1.6M”) and I’ll update it — or say “new BPO” to start another.');
+      await sbMarkDelivered(chatId);                               // keep the session for post-delivery edits
       return true;
     }
     console.error('sendDocument failed for chat', chatId);
@@ -531,11 +533,17 @@ export default async function handler(req, res) {
       const stopTyping = startTyping(token, chatId);
       try {
         if (ackKind === 'data') await sendMessage(token, chatId, pickAck());
+
+        // A non-"new BPO" message while a delivered BPO is on file = a post-delivery correction:
+        // reuse the SAME session (which still holds the built payload) so the agent edits it.
+        const editingDelivered = !wantStart && row && row.status === 'delivered' && row.session_id;
+
         let sessionId;
-        if (wantStart || !row) {            // START: fresh session
+        if (wantStart || !row) {            // START: fresh session, wiped clean
           const s = await newSession();
           sessionId = s.id;
           await sbUpsert(chatId, sessionId, s.envId);
+          await sbClearState(chatId);       // drop any prior delivered/generating/failed state
         } else {                            // REUSE: same stateful session = memory
           sessionId = row.session_id;
         }
@@ -548,7 +556,12 @@ export default async function handler(req, res) {
         try {
           reply = await sendTurn(sessionId, toSend, deadline);
         } catch (e) {
-          // Stored session/env was reclaimed — start a fresh session once and resend.
+          // The stored session/env was reclaimed. For a post-delivery edit the context is gone,
+          // so recreating blank would lose the BPO — tell the broker to restart instead.
+          if (editingDelivered) {
+            await sendMessage(token, chatId, "That BPO’s session has expired, so I can’t edit it in place anymore. Send “new BPO” and I’ll rebuild it.");
+            return;
+          }
           const s = await newSession();
           sessionId = s.id;
           await sbUpsert(chatId, sessionId, s.envId);
