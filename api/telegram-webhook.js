@@ -37,7 +37,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-10-tg-6';
+const VERSION = '2026-06-10-tg-7';
 
 // A chat marked "generating" within this window blocks a second generation (double-gen
 // guard). Beyond it the mark is treated as stale (a truly dead run) and generation may retry.
@@ -116,6 +116,25 @@ async function sendDocument(token, chatId, bytes, filename) {
   const resp = await fetch(TG_API(token, 'sendDocument'), { method: 'POST', body: fd });
   let info = null; try { info = await resp.json(); } catch { /* ignore */ }
   return info ? !!info.ok : resp.ok;
+}
+
+// ---- inbound file retrieval (getFile -> download bytes). Prerequisite for xlsx/photo/voice. ----
+async function tgGetFile(token, fileId) {
+  // getFile resolves a file_id to a file_path (works for files up to ~20 MB via the bot API).
+  const resp = await fetch(`${TG_API(token, 'getFile')}?file_id=${encodeURIComponent(fileId)}`);
+  let info = null; try { info = await resp.json(); } catch { /* ignore */ }
+  return info && info.ok ? info.result : null; // { file_id, file_unique_id, file_size, file_path }
+}
+async function tgDownloadFile(token, filePath) {
+  const resp = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`);
+  if (!resp.ok) return null;
+  return Buffer.from(await resp.arrayBuffer());
+}
+function humanSize(n) {
+  if (n == null || !Number.isFinite(n)) return 'unknown size';
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  if (n >= 1024) return Math.round(n / 1024) + ' KB';
+  return n + ' bytes';
 }
 
 // "typing" chat action (broker sees the bot is active). Expires ~5s, so we pulse it.
@@ -331,7 +350,36 @@ export default async function handler(req, res) {
   const chatId = msg.chat.id;
   if (!token) return res.status(200).json({ ok: true, version: VERSION, type, sent: false, reason: 'TELEGRAM_BOT_TOKEN not set in Vercel env' });
 
-  // Non-text: stub (this increment is text-only; xlsx/photo/voice are the NEXT build per N7).
+  // DOCUMENT: prove byte retrieval (getFile -> download). No parsing yet — this is the
+  // prerequisite that unlocks xlsx -> parse-rentroll, photos, and voice in the next build.
+  if (type === 'document') {
+    res.status(200).json({ ok: true, version: VERSION, type, mode: 'file-fetch' });
+    const doc = msg.document;
+    waitUntil((async () => {
+      try {
+        const meta = await tgGetFile(token, doc.file_id);
+        if (!meta || !meta.file_path) {
+          await sendMessage(token, chatId, `Received ${doc.file_name || 'a file'}, but Telegram wouldn’t hand it over (too large for the bot API, >20 MB?).`);
+          return;
+        }
+        const bytes = await tgDownloadFile(token, meta.file_path);
+        if (!bytes) {
+          await sendMessage(token, chatId, `Received ${doc.file_name || 'a file'}, but the download failed.`);
+          return;
+        }
+        const name = doc.file_name || meta.file_path.split('/').pop();
+        const mime = doc.mime_type || 'unknown type';
+        // Report the ACTUAL downloaded byte count — proves the bytes are in hand.
+        await sendMessage(token, chatId, `Received ${name} — ${humanSize(bytes.length)} (${bytes.length.toLocaleString()} bytes), ${mime}. Got the file; not parsing it yet.`);
+      } catch (e) {
+        try { await sendMessage(token, chatId, `Received ${doc.file_name || 'a file'}, but hit an error reading it.`); } catch { /* ignore */ }
+      }
+    })());
+    return;
+  }
+
+  // Other non-text (photo/voice/etc.): stub for now — next build wires these on top of the
+  // byte-retrieval proven above.
   if (type !== 'text') {
     res.status(200).json({ ok: true, version: VERSION, type, mode: 'stub' });
     waitUntil((async () => { try { await sendMessage(token, chatId, `received a ${type} — not handled yet`); } catch { /* ignore */ } })());
