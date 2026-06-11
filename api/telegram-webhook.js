@@ -37,7 +37,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-10-tg-7';
+const VERSION = '2026-06-10-tg-8';
 
 // A chat marked "generating" within this window blocks a second generation (double-gen
 // guard). Beyond it the mark is treated as stale (a truly dead run) and generation may retry.
@@ -46,6 +46,7 @@ const GENERATING_TTL_MS = 240000;
 // Rebuilt agent governed by base workflow + agents/telegram-delivery-contract.md.
 const AGENT_ID = process.env.BROKEROS_AGENT_ID || 'agent_0158kmQA7nKFSB6xRdTSfJ2C';
 const GENERATE_PDF_URL = 'https://brokeros-config.vercel.app/api/generate-pdf';
+const PARSE_RENTROLL_URL = 'https://brokeros-config.vercel.app/api/parse-rentroll';
 
 const TERMINAL = new Set(['session.status_idle', 'session.status_terminated', 'session.error']);
 const TG_API = (token, m) => `https://api.telegram.org/bot${token}/${m}`;
@@ -64,6 +65,10 @@ const STATUS_RE = /\b(still (coming|building|there|working|waiting)|you (there|u
 // reply lands fast; no separate "working on that" ack (typing carries it).
 const CONFIRM_RE = /^\s*(looks?\s+good|that'?s?\s+(right|correct|it|good)|correct|confirm(ed)?|yes|yep|yeah|yup|ok(ay)?|sure|sounds?\s+good|perfect|great|all\s+good|that\s+works|works(\s+for\s+me)?|go\s+ahead|go|run\s+with\s+it|just\s+run.*|do\s+it|please\s+do|fine|good|right)\b/i;
 
+// FILE receipt check ("did you get the file?", "you get it?", "did it come through?") -> answer
+// from what we actually received, not a generic status line.
+const FILE_STATUS_RE = /(did|do)\s+you\s+(get|got|have|receive|see)\b|\byou\s+(get|got|receive)\s+(it|that|the|my)\b|\b(get|got)\s+(the|my)\s+(file|upload|spreadsheet|rent\s*roll|doc|sheet)\b|\bcome\s+through\b/i;
+
 // Varied "processing" acks for substantive DATA turns (rotated, no back-to-back repeat).
 const DATA_ACKS = ['On it…', 'Got it, one sec…', 'Working on that…', 'Let me pull that together…', 'Got it — give me a moment…'];
 let lastAckIdx = -1;
@@ -76,10 +81,28 @@ function pickAck() {
 // Classify the inbound text for ack purposes: 'status' | 'confirm' | 'data'.
 function classifyAck(text) {
   const t = String(text || '').trim();
-  if (STATUS_RE.test(t)) return 'status';
+  if (STATUS_RE.test(t) || FILE_STATUS_RE.test(t)) return 'status';
   const words = t.split(/\s+/).filter(Boolean).length;
   if (CONFIRM_RE.test(t) || (words <= 4 && t.length < 40)) return 'confirm';
   return 'data';
+}
+
+// Remember the most recent inbound file per chat (module scope persists across warm
+// invocations) so an immediate "did you get the file?" gets a real answer.
+const recentUploads = new Map(); // chatId -> { name, kind, supported, readable, at }
+const UPLOAD_TTL_MS = 600000;
+function recordUpload(chatId, info) { recentUploads.set(String(chatId), { ...info, at: Date.now() }); }
+function getRecentUpload(chatId) {
+  const u = recentUploads.get(String(chatId));
+  return u && (Date.now() - u.at) < UPLOAD_TTL_MS ? u : null;
+}
+// Human label for an unsupported upload type.
+function readableType(kind) {
+  return ({ document: 'documents', photo: 'images', voice: 'voice notes', audio: 'audio',
+    video: 'videos', video_note: 'video notes', sticker: 'stickers' })[kind] || kind;
+}
+function isXlsxDoc(doc) {
+  return /\.xlsx?$/i.test(doc.file_name || '') || /spreadsheetml|ms-excel/i.test(doc.mime_type || '');
 }
 
 // ---- message-type routing (unchanged) ----
@@ -303,6 +326,78 @@ async function runGeneration(token, chatId, payload) {
   return false;
 }
 
+// ---- xlsx rent-roll: bridge parses, then injects the tenants into the agent session ----
+async function parseRentRoll(bytes) {
+  const body = new URLSearchParams({ file_base64: bytes.toString('base64') }).toString();
+  let r;
+  try { r = await fetch(PARSE_RENTROLL_URL, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body }); }
+  catch (e) { return { ok: false, detail: String((e && e.message) || e) }; }
+  const j = await r.json().catch(() => null);
+  if (r.ok && j && Array.isArray(j.tenants)) return { ok: true, tenants: j.tenants };
+  return { ok: false, detail: (j && (j.detail || j.error)) || ('HTTP ' + r.status) };
+}
+
+// An xlsx arrived: download -> parse -> inject parsed tenants into the chat's session so the
+// agent goes straight to the per-suite confirmation (broker never types an uploaded rent roll).
+async function handleXlsx(token, chatId, doc) {
+  const stop = startTyping(token, chatId);
+  try {
+    const meta = await tgGetFile(token, doc.file_id);
+    const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
+    if (!bytes) {
+      recordUpload(chatId, { name: doc.file_name || 'your spreadsheet', kind: 'document', supported: false, readable: 'that file' });
+      await sendMessage(token, chatId, `Got ${doc.file_name || 'your file'}, but couldn’t download it from Telegram. Type the rent roll and I’ll take it from there.`);
+      return;
+    }
+    const parsed = await parseRentRoll(bytes);
+    if (!parsed.ok || !parsed.tenants.length) {
+      console.error('parse-rentroll failed:', parsed.detail);
+      recordUpload(chatId, { name: doc.file_name || 'your spreadsheet', kind: 'document', supported: false, readable: 'that spreadsheet' });
+      await sendMessage(token, chatId, `Got ${doc.file_name || 'your spreadsheet'}, but I couldn’t read a rent roll from it${parsed.detail ? ` (${parsed.detail})` : ''}. You can type the rent roll instead.`);
+      return;
+    }
+    recordUpload(chatId, { name: doc.file_name || 'your spreadsheet', kind: 'xlsx', supported: true, readable: 'spreadsheet' });
+
+    // Resolve/continue the chat's BPO session.
+    let row = await sbGet(chatId);
+    let sessionId;
+    if (!row) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
+    else sessionId = row.session_id;
+
+    const injection =
+      `[The broker uploaded a rent-roll spreadsheet "${doc.file_name || 'rent_roll.xlsx'}". It has already been parsed for you — do NOT ask them to type it. Use these tenants EXACTLY as given (carry odd values through), and go straight to the RENT-ROLL CONFIRMATION step now.]\n` +
+      `Parsed tenants (JSON):\n${JSON.stringify(parsed.tenants)}`;
+
+    const deadline = Date.now() + 200000;
+    let reply;
+    try { reply = await sendTurn(sessionId, injection, deadline); }
+    catch (e) {
+      const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId);
+      reply = await sendTurn(sessionId, injection, deadline);
+    }
+    if (!reply) { await sendMessage(token, chatId, `Read ${parsed.tenants.length} tenants from ${doc.file_name || 'your spreadsheet'}, but couldn’t get the confirmation back in time. Send it again.`); return; }
+
+    const payload = extractGenerate(reply);
+    if (payload) { await runGeneration(token, chatId, payload); return; }
+    await sbTouch(chatId);
+    await sendMessage(token, chatId, reply);
+  } catch (e) {
+    console.error('handleXlsx error:', (e && e.message) || e);
+    try { await sendMessage(token, chatId, `Got ${doc.file_name || 'your file'}, but hit an error processing it. Type the rent roll and I’ll continue.`); } catch { /* ignore */ }
+  } finally {
+    stop();
+  }
+}
+
+// Unsupported upload (non-xlsx doc, photo, voice, etc.): acknowledge it by name, say plainly
+// it can't be read yet, and give the broker the actionable fallback.
+async function handleUnsupportedFile(token, chatId, fileName, kind) {
+  const label = readableType(kind);
+  recordUpload(chatId, { name: fileName || `your ${kind}`, kind, supported: false, readable: label });
+  const what = fileName ? `Got ${fileName}` : `Got your ${kind === 'voice' ? 'voice note' : kind}`;
+  await sendMessage(token, chatId, `${what}, but I can’t read ${label} yet — type the details and I’ll take it from there.`);
+}
+
 export default async function handler(req, res) {
   // Secret-safe Supabase round-trip self-test (GET ?selftest=supabase). Uses the server-side
   // service key already in env (never returned); writes/reads/deletes a sentinel row to prove
@@ -350,39 +445,24 @@ export default async function handler(req, res) {
   const chatId = msg.chat.id;
   if (!token) return res.status(200).json({ ok: true, version: VERSION, type, sent: false, reason: 'TELEGRAM_BOT_TOKEN not set in Vercel env' });
 
-  // DOCUMENT: prove byte retrieval (getFile -> download). No parsing yet — this is the
-  // prerequisite that unlocks xlsx -> parse-rentroll, photos, and voice in the next build.
+  // DOCUMENT: an XLSX is parsed (parse-rentroll) and injected into the session as the rent
+  // roll; any other document is acknowledged with the actionable "type it instead" fallback.
   if (type === 'document') {
-    res.status(200).json({ ok: true, version: VERSION, type, mode: 'file-fetch' });
     const doc = msg.document;
-    waitUntil((async () => {
-      try {
-        const meta = await tgGetFile(token, doc.file_id);
-        if (!meta || !meta.file_path) {
-          await sendMessage(token, chatId, `Received ${doc.file_name || 'a file'}, but Telegram wouldn’t hand it over (too large for the bot API, >20 MB?).`);
-          return;
-        }
-        const bytes = await tgDownloadFile(token, meta.file_path);
-        if (!bytes) {
-          await sendMessage(token, chatId, `Received ${doc.file_name || 'a file'}, but the download failed.`);
-          return;
-        }
-        const name = doc.file_name || meta.file_path.split('/').pop();
-        const mime = doc.mime_type || 'unknown type';
-        // Report the ACTUAL downloaded byte count — proves the bytes are in hand.
-        await sendMessage(token, chatId, `Received ${name} — ${humanSize(bytes.length)} (${bytes.length.toLocaleString()} bytes), ${mime}. Got the file; not parsing it yet.`);
-      } catch (e) {
-        try { await sendMessage(token, chatId, `Received ${doc.file_name || 'a file'}, but hit an error reading it.`); } catch { /* ignore */ }
-      }
-    })());
+    const xlsx = isXlsxDoc(doc);
+    res.status(200).json({ ok: true, version: VERSION, type, mode: xlsx ? 'xlsx' : 'unsupported-file' });
+    if (xlsx && !sbConfigured()) {
+      waitUntil((async () => { try { await sendMessage(token, chatId, '⚙️ Session store not configured yet — add SUPABASE_URL and SUPABASE_SERVICE_KEY in Vercel and redeploy.'); } catch { /* ignore */ } })());
+      return;
+    }
+    waitUntil(xlsx ? handleXlsx(token, chatId, doc) : handleUnsupportedFile(token, chatId, doc.file_name, 'document'));
     return;
   }
 
-  // Other non-text (photo/voice/etc.): stub for now — next build wires these on top of the
-  // byte-retrieval proven above.
+  // Other non-text (photo/voice/etc.): acknowledge by type with the actionable fallback.
   if (type !== 'text') {
-    res.status(200).json({ ok: true, version: VERSION, type, mode: 'stub' });
-    waitUntil((async () => { try { await sendMessage(token, chatId, `received a ${type} — not handled yet`); } catch { /* ignore */ } })());
+    res.status(200).json({ ok: true, version: VERSION, type, mode: 'unsupported-file' });
+    waitUntil(handleUnsupportedFile(token, chatId, null, type));
     return;
   }
 
@@ -420,6 +500,14 @@ export default async function handler(req, res) {
 
       // STATUS check-in -> answer with real state, no agent turn, no generic ack.
       if (ackKind === 'status') {
+        // "did you get the file?" -> answer from what we actually received.
+        const up = getRecentUpload(chatId);
+        if (FILE_STATUS_RE.test(incoming) && up) {
+          await sendMessage(token, chatId, up.supported
+            ? `Yes — got ${up.name}. Working through it now.`
+            : `Yes — got ${up.name}. But I can’t read ${up.readable} yet — type the details and I’ll take it from there.`);
+          return;
+        }
         await answerStatus(token, chatId, row);
         return;
       }

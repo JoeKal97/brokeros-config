@@ -86,17 +86,15 @@ the rent roll still uses the per-suite confirmation block below):
   - **Broker TYPES or pastes it as text:** capture conversationally, as before — per tenant:
     suite, name, size SF, rent $/SF/yr, annual rent, market rent (if known), lease start/end.
     (This path is unchanged.)
-  - **Broker UPLOADS an xlsx file (Telegram document):** do NOT open or read it.
-    0. If you CANNOT retrieve the uploaded file's raw bytes, do NOT attempt to open, read, or
-       parse the spreadsheet yourself. Tell the broker exactly: "I can't process the uploaded
-       file directly — please type or paste the rent roll and I'll take it from there," and fall
-       back to the typed-text path above.
-    1. Base64-encode the RAW file bytes WITHOUT opening, reading, parsing, or interpreting the
-       spreadsheet contents in any way.
-    2. POST form-urlencoded to `https://brokeros-config.vercel.app/api/parse-rentroll`,
-       body: `file_base64=<URL-encoded base64>`.
-    3. Take the returned `tenants[]` and use it DIRECTLY as the `tenants` array in the
-       generate-pdf payload — do not modify, recompute, or "clean" any values.
+  - **Rent roll arrives ALREADY PARSED from an upload:** when the broker uploads a rent-roll
+    spreadsheet, the system parses it for you and hands you a ready `tenants[]` array inside the
+    message. You never open, read, fetch, or POST any file — that is done for you. When tenants
+    arrive this way:
+    - Do NOT ask the broker to type or paste the rent roll — you already have it.
+    - Use the tenants EXACTLY as given. Do not modify, recompute, reformat, or "clean" any
+      values — carry odd-looking numbers through verbatim so the broker can catch them at
+      confirmation (that's the point of the confirmation step).
+    - Go STRAIGHT to the RENT-ROLL CONFIRMATION step below, populated from those tenants.
   - EITHER WAY, then run the RENT-ROLL CONFIRMATION step (below) before generating.
 - **RENT-ROLL CONFIRMATION (required):** after you have captured the full rent roll,
   display it back to the broker using EXACTLY this block format — one block per tenant, in
