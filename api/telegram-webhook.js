@@ -37,14 +37,14 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-10-tg-4';
+const VERSION = '2026-06-10-tg-5';
 
 // A chat marked "generating" within this window blocks a second generation (double-gen
 // guard). Beyond it the mark is treated as stale (a truly dead run) and generation may retry.
 const GENERATING_TTL_MS = 240000;
 
 // Rebuilt agent governed by base workflow + agents/telegram-delivery-contract.md.
-const AGENT_ID = process.env.BROKEROS_AGENT_ID || 'agent_01P5UgeExc512tsiW8ePCcyR';
+const AGENT_ID = process.env.BROKEROS_AGENT_ID || 'agent_0158kmQA7nKFSB6xRdTSfJ2C';
 const GENERATE_PDF_URL = 'https://brokeros-config.vercel.app/api/generate-pdf';
 
 const TERMINAL = new Set(['session.status_idle', 'session.status_terminated', 'session.error']);
@@ -54,6 +54,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const START_RE = /^\s*\/?(start|new)\b/i;          // "/start", "/new", "new bpo", "new ..."
 const NEWBPO_RE = /\bnew\s*bpo\b/i;
 const END_RE = /^\s*\/?(cancel|done|reset|stop)\b/i;
+const RETRY_RE = /^\s*\/?(retry|resend|try\s*again|again|yes|yep|yeah|yup|ok(ay)?|sure|go|please)\b/i; // after a failed generation
 
 // ---- message-type routing (unchanged) ----
 function classify(msg) {
@@ -135,16 +136,20 @@ async function sbTouch(chatId) {
 async function sbDelete(chatId) {
   await fetch(`${SB_URL}/rest/v1/telegram_sessions?telegram_chat_id=eq.${chatId}`, { method: 'DELETE', headers: { ...sbHeaders(), Prefer: 'return=minimal' } });
 }
-// Double-generation guard state (requires status + generating_since columns; degrades to
-// no-guard if the ALTER TABLE hasn't been run — the PATCH simply no-ops on unknown columns).
-async function sbSetGenerating(chatId, on) {
+// Generation state (requires status + generating_since + last_payload columns; degrades to
+// no-guard / no-retry-memory if the ALTER TABLE hasn't been run — PATCH no-ops on unknown cols).
+async function sbPatch(chatId, fields) {
   await fetch(`${SB_URL}/rest/v1/telegram_sessions?telegram_chat_id=eq.${chatId}`, {
     method: 'PATCH', headers: { ...sbHeaders(), Prefer: 'return=minimal' },
-    body: JSON.stringify(on
-      ? { status: 'generating', generating_since: new Date().toISOString() }
-      : { status: null, generating_since: null }),
+    body: JSON.stringify(fields),
   });
 }
+// Mark a chat as actively generating and stash the exact payload so a retry can re-POST it
+// without another agent round trip.
+const sbMarkGenerating = (chatId, payload) => sbPatch(chatId, { status: 'generating', generating_since: new Date().toISOString(), last_payload: payload });
+const sbMarkFailed = (chatId) => sbPatch(chatId, { status: 'generate_failed', generating_since: null }); // keep last_payload for retry
+const sbClearState = (chatId) => sbPatch(chatId, { status: null, generating_since: null, last_payload: null });
+
 function isGeneratingActive(row) {
   if (!row || row.status !== 'generating') return false;
   const since = row.generating_since ? Date.parse(row.generating_since) : 0;
@@ -193,23 +198,54 @@ function extractGenerate(reply) {
   if (!jtxt) return null;
   try { return JSON.parse(jtxt); } catch { return null; }
 }
-async function generateAndDeliver(token, chatId, payload) {
-  await sendMessage(token, chatId, 'Building your BPO now ⏳');
+// Call /api/generate-pdf with the payload. Returns a structured result; NO Telegram messaging
+// here (the bridge owns all broker-facing wording, based on the actual outcome).
+async function generatePdf(payload) {
   const body = new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
-  const r = await fetch(GENERATE_PDF_URL, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+  let r;
+  try {
+    r = await fetch(GENERATE_PDF_URL, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+  } catch (e) {
+    return { ok: false, status: 0, kind: 'network', detail: String((e && e.message) || e) };
+  }
   const ct = (r.headers.get('content-type') || '').toLowerCase();
   if (r.ok && ct.includes('application/pdf')) {
-    const bytes = Buffer.from(await r.arrayBuffer());
+    return { ok: true, bytes: Buffer.from(await r.arrayBuffer()) };
+  }
+  const detail = await r.text().catch(() => '');
+  // Classify the failure so the broker sees a meaningful message (PDFShift credits exhausted is
+  // a service/billing issue, not "your data is bad").
+  const kind = /no remaining credits|credits left|\b402\b|\b403\b/i.test(detail) ? 'credits' : 'service';
+  return { ok: false, status: r.status, kind, detail };
+}
+
+// Bridge owns ALL "building / sent / failed" messaging, driven by real results. The agent
+// never speaks to delivery. On failure we keep the stashed payload so a retry can re-run.
+async function runGeneration(token, chatId, payload) {
+  await sbMarkGenerating(chatId, payload);                 // stash payload + block resends
+  await sendMessage(token, chatId, 'Building your BPO now ⏳');
+  const result = await generatePdf(payload);
+
+  if (result.ok) {
     const addr = (payload.subject && payload.subject.address_line1) || 'BPO';
     const fname = `Eagen_BPO_${String(addr).replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '')}.pdf`;
-    if (await sendDocument(token, chatId, bytes, fname)) {   // attach FIRST
-      await sendMessage(token, chatId, '✅ Your BPO is ready.');  // THEN confirm
+    if (await sendDocument(token, chatId, result.bytes, fname)) {  // attach FIRST
+      await sendMessage(token, chatId, '✅ Your BPO is ready.');     // THEN confirm — only after a real send
+      await sbDelete(chatId);                                       // success ends the session
       return true;
     }
-    await sendMessage(token, chatId, '⚠️ I built your BPO but could not attach it — please try again.');
+    console.error('sendDocument failed for chat', chatId);
+    await sendMessage(token, chatId, '⚠️ I built your BPO but couldn’t attach it. Reply "retry" to resend.');
+    await sbMarkFailed(chatId);
     return false;
   }
-  await sendMessage(token, chatId, '⚠️ Hit a snag building the PDF — want me to try again?');
+
+  console.error('generate-pdf failed:', result.status, result.kind, result.detail);
+  const msg = result.kind === 'credits'
+    ? '⚠️ The PDF service is temporarily unavailable. Your BPO is saved — reply "retry" and I’ll finish it as soon as it’s back.'
+    : '⚠️ Hit a snag building the PDF. Reply "retry" to try again.';
+  await sendMessage(token, chatId, msg);
+  await sbMarkFailed(chatId);
   return false;
 }
 
@@ -297,6 +333,19 @@ export default async function handler(req, res) {
         return;
       }
 
+      // RETRY after a failed generation: re-run the stashed payload directly (no agent round
+      // trip, no reliance on the agent re-emitting). Any other message clears the failed state
+      // and routes to the agent normally (so the broker can also correct data instead).
+      if (row && row.status === 'generate_failed' && row.last_payload) {
+        if (RETRY_RE.test(incoming)) {
+          const stop = startTyping(token, chatId);
+          try { await runGeneration(token, chatId, row.last_payload); } finally { stop(); }
+          return;
+        }
+        await sbClearState(chatId); // not a retry -> fall through to a normal agent turn
+        row = { ...row, status: null };
+      }
+
       // Acknowledge immediately so the broker never wonders if it's working, then keep a
       // "typing" indicator alive for the whole turn. (Acknowledgment only — no exposition.)
       await sendMessage(token, chatId, 'Got it — working on that…');
@@ -328,23 +377,16 @@ export default async function handler(req, res) {
 
         if (!reply) { await sendMessage(token, chatId, "Sorry — I couldn't get a reply in time. Please try again."); return; }
 
-        // Generation signal?
+        // Generation signal? Hand the payload to the bridge — it owns building/sent/failed.
         const payload = extractGenerate(reply);
         if (payload) {
-          await sbSetGenerating(chatId, true);     // mark before the heavy render -> blocks resends
-          let ok = false;
-          try {
-            ok = await generateAndDeliver(token, chatId, payload);
-          } finally {
-            if (ok) await sbDelete(chatId);          // successful PDF ends the session
-            else await sbSetGenerating(chatId, false); // failed -> clear the mark so retry is allowed
-          }
+          await runGeneration(token, chatId, payload);
           return;
         }
 
-        // Normal conversational turn.
+        // Normal conversational turn. (Strip any stray GENERATE_BPO marker just in case.)
         await sbTouch(chatId);
-        await sendMessage(token, chatId, reply);
+        await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
       } finally {
         stopTyping();
       }
