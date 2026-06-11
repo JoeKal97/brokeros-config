@@ -37,7 +37,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-10-tg-5';
+const VERSION = '2026-06-10-tg-6';
 
 // A chat marked "generating" within this window blocks a second generation (double-gen
 // guard). Beyond it the mark is treated as stale (a truly dead run) and generation may retry.
@@ -55,6 +55,32 @@ const START_RE = /^\s*\/?(start|new)\b/i;          // "/start", "/new", "new bpo
 const NEWBPO_RE = /\bnew\s*bpo\b/i;
 const END_RE = /^\s*\/?(cancel|done|reset|stop)\b/i;
 const RETRY_RE = /^\s*\/?(retry|resend|try\s*again|again|yes|yep|yeah|yup|ok(ay)?|sure|go|please)\b/i; // after a failed generation
+
+// STATUS check-in ("you there?", "where's my PDF", "any update", "done yet?") -> answer with
+// real status, not a generic ack.
+const STATUS_RE = /\b(still (coming|building|there|working|waiting)|you (there|up|alive)|are you (there|alive|working)|where('?s| is)?\s+(my\s+|the\s+)?(pdf|bpo|report|doc(ument)?|it|that)|how('?s| is)\s+(it|that|this)\s+(going|coming|looking)|any\s+update|done\s+yet|ready\s+yet|finished\s+yet|did\s+(it|that|you)\s+(send|go|work|get)|hello\??|you\s+working)\b/i;
+
+// Short confirmation/answer ("looks good", "go ahead", "correct", "all missoula") -> the agent
+// reply lands fast; no separate "working on that" ack (typing carries it).
+const CONFIRM_RE = /^\s*(looks?\s+good|that'?s?\s+(right|correct|it|good)|correct|confirm(ed)?|yes|yep|yeah|yup|ok(ay)?|sure|sounds?\s+good|perfect|great|all\s+good|that\s+works|works(\s+for\s+me)?|go\s+ahead|go|run\s+with\s+it|just\s+run.*|do\s+it|please\s+do|fine|good|right)\b/i;
+
+// Varied "processing" acks for substantive DATA turns (rotated, no back-to-back repeat).
+const DATA_ACKS = ['On it…', 'Got it, one sec…', 'Working on that…', 'Let me pull that together…', 'Got it — give me a moment…'];
+let lastAckIdx = -1;
+function pickAck() {
+  let i = Math.floor(Math.random() * DATA_ACKS.length);
+  if (DATA_ACKS.length > 1 && i === lastAckIdx) i = (i + 1) % DATA_ACKS.length;
+  lastAckIdx = i;
+  return DATA_ACKS[i];
+}
+// Classify the inbound text for ack purposes: 'status' | 'confirm' | 'data'.
+function classifyAck(text) {
+  const t = String(text || '').trim();
+  if (STATUS_RE.test(t)) return 'status';
+  const words = t.split(/\s+/).filter(Boolean).length;
+  if (CONFIRM_RE.test(t) || (words <= 4 && t.length < 40)) return 'confirm';
+  return 'data';
+}
 
 // ---- message-type routing (unchanged) ----
 function classify(msg) {
@@ -154,6 +180,15 @@ function isGeneratingActive(row) {
   if (!row || row.status !== 'generating') return false;
   const since = row.generating_since ? Date.parse(row.generating_since) : 0;
   return Number.isFinite(since) && since > 0 && (Date.now() - since) < GENERATING_TTL_MS;
+}
+
+// Answer a STATUS check-in with the real state — never a generic ack. (Mid-generation is
+// caught earlier by the guard; this covers failed / active-idle / no-session.)
+async function answerStatus(token, chatId, row) {
+  if (isGeneratingActive(row)) return sendMessage(token, chatId, 'Still building your BPO — about 30 seconds…');
+  if (row && row.status === 'generate_failed') return sendMessage(token, chatId, "That last build didn’t go through — reply \"retry\" and I’ll finish it.");
+  if (row && row.session_id) return sendMessage(token, chatId, "I’m here — still on your BPO. Send the next detail whenever you’re ready.");
+  return sendMessage(token, chatId, "I’m here. Send \"new BPO\" to start one.");
 }
 
 // ---- Managed Agent session ----
@@ -327,9 +362,17 @@ export default async function handler(req, res) {
       let row = await sbGet(chatId);
 
       // DOUBLE-GENERATION GUARD: if a PDF is already being built for this chat, don't start
-      // a second generation (or even a second agent turn) — just reassure and return.
+      // a second generation (or even a second agent turn) — give real status.
       if (isGeneratingActive(row)) {
-        await sendMessage(token, chatId, 'Still building your BPO — one moment…');
+        await sendMessage(token, chatId, 'Still building your BPO — about 30 seconds…');
+        return;
+      }
+
+      const ackKind = classifyAck(incoming);
+
+      // STATUS check-in -> answer with real state, no agent turn, no generic ack.
+      if (ackKind === 'status') {
+        await answerStatus(token, chatId, row);
         return;
       }
 
@@ -346,11 +389,12 @@ export default async function handler(req, res) {
         row = { ...row, status: null };
       }
 
-      // Acknowledge immediately so the broker never wonders if it's working, then keep a
-      // "typing" indicator alive for the whole turn. (Acknowledgment only — no exposition.)
-      await sendMessage(token, chatId, 'Got it — working on that…');
+      // Keep the typing indicator alive for the whole turn (primary "it's alive" signal).
+      // Substantive DATA turns also get a short, VARIED text ack; short confirmations get
+      // none (the agent reply lands fast — typing carries it).
       const stopTyping = startTyping(token, chatId);
       try {
+        if (ackKind === 'data') await sendMessage(token, chatId, pickAck());
         let sessionId;
         if (wantStart || !row) {            // START: fresh session
           const s = await newSession();
