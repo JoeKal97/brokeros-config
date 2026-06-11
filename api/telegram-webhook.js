@@ -37,7 +37,18 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-11-tg-10';
+const VERSION = '2026-06-11-tg-10b';
+
+// --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
+const MODULE_LOADED_AT = Date.now();
+let instanceServed = 0;            // requests handled by this (warm) instance
+let lastTiming = null;             // breakdown of the most recent turn
+function newTiming(kind, chatId) {
+  instanceServed += 1;
+  return { kind, chat: String(chatId), t0: Date.now(), uptime_ms: Math.round(process.uptime() * 1000), instanceServed, marks: {} };
+}
+function mark(tm, label) { if (tm) tm.marks[label] = Date.now() - tm.t0; }
+function commitTiming(tm) { if (tm) { tm.total_ms = Date.now() - tm.t0; delete tm.t0; lastTiming = tm; } }
 
 // A chat marked "generating" within this window blocks a second generation (double-gen
 // guard). Beyond it the mark is treated as stale (a truly dead run) and generation may retry.
@@ -419,23 +430,27 @@ async function uploadPhoto(bytes, key, ext) {
 // A PHOTO arrived: grab bytes (tg-7), store in the bucket, inject the public URL into the
 // agent session as the SUBJECT photo. Bridge does all file work; agent only places the URL.
 async function handlePhoto(token, chatId, photos) {
+  const _tm = newTiming('photo', chatId);
   const stop = startTyping(token, chatId);
   try {
     const best = Array.isArray(photos) && photos.length ? photos[photos.length - 1] : null; // largest size
     const meta = best ? await tgGetFile(token, best.file_id) : null;
     const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
+    mark(_tm, 'downloaded');
     if (!bytes) {
       await sendMessage(token, chatId, "Couldn’t grab that image from Telegram — send it again.");
       return;
     }
     const ext = ((meta.file_path.match(/\.([A-Za-z0-9]+)$/) || [])[1] || 'jpg').toLowerCase();
     const url = await uploadPhoto(bytes, `${chatId}/${Date.now()}.${ext}`, ext);
+    mark(_tm, 'uploaded');
     if (!url) {
       await sendMessage(token, chatId, "Couldn’t save that image — try again.");
       return;
     }
     recordUpload(chatId, { name: 'the property photo', kind: 'photo', supported: true, readable: 'images' });
     await sendMessage(token, chatId, 'Got the property photo.'); // bridge owns the confirmation
+    mark(_tm, 'photoConfirm');
 
     // Inject the URL into the chat's session so the agent puts it in subject.photo_url.
     let row = await sbGet(chatId);
@@ -451,6 +466,7 @@ async function handlePhoto(token, chatId, photos) {
       const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId);
       reply = await sendTurn(sessionId, injection, deadline);
     }
+    mark(_tm, 'agentReply');
     if (!reply) return; // already confirmed "Got the property photo."
     const payload = extractGenerate(reply);
     if (payload) { await runGeneration(token, chatId, payload); return; }
@@ -461,6 +477,7 @@ async function handlePhoto(token, chatId, photos) {
     try { await sendMessage(token, chatId, "Hit an error saving that photo — send it again."); } catch { /* ignore */ }
   } finally {
     stop();
+    commitTiming(_tm);
   }
 }
 
@@ -480,6 +497,16 @@ export default async function handler(req, res) {
     } catch (e) {
       return res.status(200).json({ selftest: 'supabase', ok: false, error: String((e && e.message) || e) });
     }
+  }
+  // Diagnostic: latency breakdown of the most recent turn (ms from background start).
+  if (req.method === 'GET' && req.query && req.query.selftest === 'timing') {
+    return res.status(200).json({
+      selftest: 'timing',
+      module_age_ms: Date.now() - MODULE_LOADED_AT,
+      instance_served: instanceServed,
+      now_uptime_ms: Math.round(process.uptime() * 1000),
+      lastTiming,
+    });
   }
   // Diagnostic: which agent does PROD actually resolve, and is it live? (agent_id/name are
   // not secrets.) Proves env-override vs bundled-default and that it isn't the archived agent.
@@ -554,6 +581,7 @@ export default async function handler(req, res) {
   res.status(200).json({ ok: true, version: VERSION, type, mode: 'agent-async' });
   const incoming = msg.text;
 
+  const _tm = newTiming('text', chatId); // latency diagnostics (t0 = background start)
   waitUntil((async () => {
     try {
       // Explicit END command.
@@ -565,6 +593,7 @@ export default async function handler(req, res) {
 
       const wantStart = START_RE.test(incoming) || NEWBPO_RE.test(incoming);
       let row = await sbGet(chatId);
+      mark(_tm, 'sbGet');
 
       // DOUBLE-GENERATION GUARD: if a PDF is already being built for this chat, don't start
       // a second generation (or even a second agent turn) — give real status.
@@ -608,6 +637,7 @@ export default async function handler(req, res) {
       const stopTyping = startTyping(token, chatId);
       try {
         if (ackKind === 'data') await sendMessage(token, chatId, pickAck());
+        mark(_tm, 'ackSent'); // typing + (for data) text ack are now on the broker's screen
 
         // A non-"new BPO" message while a delivered BPO is on file = a post-delivery correction:
         // reuse the SAME session (which still holds the built payload) so the agent edits it.
@@ -643,6 +673,7 @@ export default async function handler(req, res) {
           reply = await sendTurn(sessionId, toSend, deadline);
         }
 
+        mark(_tm, 'agentReply'); // agent produced its reply
         if (!reply) { await sendMessage(token, chatId, "Sorry — I couldn't get a reply in time. Please try again."); return; }
 
         // Generation signal? Hand the payload to the bridge — it owns building/sent/failed.
@@ -660,6 +691,8 @@ export default async function handler(req, res) {
       }
     } catch (e) {
       try { await sendMessage(token, chatId, '⚠️ Something went wrong — please try again.'); } catch { /* ignore */ }
+    } finally {
+      commitTiming(_tm);
     }
   })());
 }
