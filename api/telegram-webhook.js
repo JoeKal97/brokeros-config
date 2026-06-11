@@ -29,7 +29,8 @@
 //   TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY,
 //   BROKEROS_AGENT_ID (optional override of the persisted agent id).
 
-import Anthropic from '@anthropic-ai/sdk';
+// NOTE: @anthropic-ai/sdk is heavy; it is lazy-loaded (dynamic import) inside the agent-call
+// path only, so it stays OUT of cold-start module init — the webhook 200 + ack fire first.
 import { waitUntil } from '@vercel/functions';
 
 // The generate turn (agent writes the full payload, then PDFShift renders 19 pages) is the
@@ -37,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-11-tg-10b';
+const VERSION = '2026-06-11-tg-11';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -247,27 +248,39 @@ async function answerStatus(token, chatId, row) {
 }
 
 // ---- Managed Agent session ----
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// Lazy SDK: imported + client constructed only on first agent call, never at module init.
+let _anthropic = null;
+async function getAnthropic() {
+  if (!_anthropic) {
+    const { default: Anthropic } = await import('@anthropic-ai/sdk');
+    _anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  }
+  return _anthropic;
+}
 let cachedEnvId = null; // one cloud env reused across sessions on a warm instance
 
 async function ensureEnv() {
   if (cachedEnvId) return cachedEnvId;
+  const anthropic = await getAnthropic();
   const env = await anthropic.beta.environments.create({ name: 'bpo-tg-env', config: { type: 'cloud' } });
   cachedEnvId = env.id;
   return cachedEnvId;
 }
 async function newSession() {
+  const anthropic = await getAnthropic();
   let envId;
   try { envId = await ensureEnv(); return { ...(await anthropic.beta.sessions.create({ agent: AGENT_ID, environment_id: envId })), envId }; }
   catch (e) { cachedEnvId = null; envId = await ensureEnv(); return { ...(await anthropic.beta.sessions.create({ agent: AGENT_ID, environment_id: envId })), envId }; }
 }
 async function collectEvents(sessionId) {
+  const anthropic = await getAnthropic();
   const evs = [];
   for await (const e of anthropic.beta.sessions.events.list(sessionId, { order: 'asc' })) evs.push(e);
   return evs;
 }
 // Send one user turn into an existing session; return only the NEW agent text for this turn.
 async function sendTurn(sessionId, text, deadlineMs) {
+  const anthropic = await getAnthropic();
   const baseline = (await collectEvents(sessionId)).length;
   await anthropic.beta.sessions.events.send(sessionId, { events: [{ type: 'user.message', content: [{ type: 'text', text }] }] });
   while (Date.now() < deadlineMs) {
@@ -433,6 +446,13 @@ async function handlePhoto(token, chatId, photos) {
   const _tm = newTiming('photo', chatId);
   const stop = startTyping(token, chatId);
   try {
+    // FIX 4: instant ack BEFORE getFile/download/upload, in parallel with the typing pulse.
+    await Promise.all([
+      sendChatAction(token, chatId, 'typing'),
+      sendMessage(token, chatId, 'Got it — saving that photo…'),
+    ]);
+    mark(_tm, 'ackSent');
+
     const best = Array.isArray(photos) && photos.length ? photos[photos.length - 1] : null; // largest size
     const meta = best ? await tgGetFile(token, best.file_id) : null;
     const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
@@ -513,6 +533,7 @@ export default async function handler(req, res) {
   if (req.method === 'GET' && req.query && req.query.selftest === 'agent') {
     const out = { selftest: 'agent', agent_id: AGENT_ID, source: process.env.BROKEROS_AGENT_ID ? 'env:BROKEROS_AGENT_ID' : 'bundled-default' };
     try {
+      const anthropic = await getAnthropic();
       const a = await anthropic.beta.agents.retrieve(AGENT_ID);
       out.name = a.name;
       out.archived = !!a.archived_at;
@@ -583,12 +604,27 @@ export default async function handler(req, res) {
 
   const _tm = newTiming('text', chatId); // latency diagnostics (t0 = background start)
   waitUntil((async () => {
+    let stopTyping = () => {};
     try {
       // Explicit END command.
       if (END_RE.test(incoming)) {
         await sbDelete(chatId);
         await sendMessage(token, chatId, "Session ended. Send 'new BPO' to start again.");
         return;
+      }
+
+      const ackKind = classifyAck(incoming);
+
+      // FIX 1+3: fire the typing indicator + (for data turns) the text ack IMMEDIATELY and in
+      // PARALLEL — before any Supabase/agent work. classifyAck is pure string work; it needs no
+      // row. Status check-ins get no ack (they're answered directly below).
+      if (ackKind !== 'status') {
+        stopTyping = startTyping(token, chatId);
+        await Promise.all([
+          sendChatAction(token, chatId, 'typing'),
+          ackKind === 'data' ? sendMessage(token, chatId, pickAck()) : Promise.resolve(),
+        ]);
+        mark(_tm, 'ackSent');
       }
 
       const wantStart = START_RE.test(incoming) || NEWBPO_RE.test(incoming);
@@ -601,8 +637,6 @@ export default async function handler(req, res) {
         await sendMessage(token, chatId, 'Still building your BPO — about 30 seconds…');
         return;
       }
-
-      const ackKind = classifyAck(incoming);
 
       // STATUS check-in -> answer with real state, no agent turn, no generic ack.
       if (ackKind === 'status') {
@@ -623,22 +657,15 @@ export default async function handler(req, res) {
       // and routes to the agent normally (so the broker can also correct data instead).
       if (row && row.status === 'generate_failed' && row.last_payload) {
         if (RETRY_RE.test(incoming)) {
-          const stop = startTyping(token, chatId);
-          try { await runGeneration(token, chatId, row.last_payload); } finally { stop(); }
+          await runGeneration(token, chatId, row.last_payload); // typing already pulsing
           return;
         }
         await sbClearState(chatId); // not a retry -> fall through to a normal agent turn
         row = { ...row, status: null };
       }
 
-      // Keep the typing indicator alive for the whole turn (primary "it's alive" signal).
-      // Substantive DATA turns also get a short, VARIED text ack; short confirmations get
-      // none (the agent reply lands fast — typing carries it).
-      const stopTyping = startTyping(token, chatId);
+      // Normal agent turn — typing is already pulsing and the ack was already sent above.
       try {
-        if (ackKind === 'data') await sendMessage(token, chatId, pickAck());
-        mark(_tm, 'ackSent'); // typing + (for data) text ack are now on the broker's screen
-
         // A non-"new BPO" message while a delivered BPO is on file = a post-delivery correction:
         // reuse the SAME session (which still holds the built payload) so the agent edits it.
         const editingDelivered = !wantStart && row && row.status === 'delivered' && row.session_id;
@@ -692,6 +719,7 @@ export default async function handler(req, res) {
     } catch (e) {
       try { await sendMessage(token, chatId, '⚠️ Something went wrong — please try again.'); } catch { /* ignore */ }
     } finally {
+      stopTyping();        // covers early-return paths (guard/status/retry); inner finally covers the rest
       commitTiming(_tm);
     }
   })());
