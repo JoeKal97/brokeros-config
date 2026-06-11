@@ -11,7 +11,7 @@
 // is the sole authority on every derived value and all HTML assembly.)
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-09c';
+const VERSION = '2026-06-11-photo1';
 
 // ---- Per-broker registry (identity + branding + template) -------------------
 const BROKERS = {
@@ -166,6 +166,18 @@ function buildComps(comps) {
   return out;
 }
 
+// Subject hero: an <img> when a photo URL is present, else the original grey placeholder so a
+// no-photo BPO still renders. PDFShift fetches the public URL when rendering.
+const COVER_PLACEHOLDER =
+  '<div class="cover-photo-placeholder">' +
+  '<svg width="60" height="60" viewBox="0 0 24 24" fill="currentColor"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>' +
+  '<span>Property Photo</span></div>';
+function subjectPhoto(url) {
+  return (url && /^https?:\/\//i.test(String(url)))
+    ? '<img src="' + esc(url) + '" alt="Subject property" style="width:100%;height:100%;object-fit:cover;display:block;" />'
+    : COVER_PLACEHOLDER;
+}
+
 // ---- Build the full {{VARIABLE}} map from the payload -----------------------
 function buildVars(payload, broker) {
   const s = payload.subject || {};
@@ -204,6 +216,7 @@ function buildVars(payload, broker) {
     SUBJECT_ADDRESS: esc(s.address_line1), SUBJECT_CITY_STATE: esc(s.city_state_zip),
     SUBJECT_PRICE: money(asking), SUBJECT_BLDG_SF: sfUnit(building_sf), SUBJECT_LOT_SF: sfUnit(lot_sf),
     SUBJECT_UNITS: intf(num(s.units)), SUBJECT_CAP: pct(capRate, 2), SUBJECT_YEAR: yearf(num(s.year_built)),
+    SUBJECT_PHOTO: subjectPhoto(s.photo_url),
     DEMOGRAPHICS_ROWS: "<tr><td colspan='4'>Demographic data available upon request.</td></tr>",
     POPULATION_ROWS: "<tr><td colspan='4'>Population data available upon request.</td></tr>",
     HOUSEHOLD_ROWS: "<tr><td colspan='4'>Household &amp; income data available upon request.</td></tr>"

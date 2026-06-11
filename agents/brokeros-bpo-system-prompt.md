@@ -123,6 +123,12 @@ the rent roll still uses the per-suite confirmation block below):
   (sold/on_market/contract), price, building SF, lot SF, units, cap rate, year built.
   NEVER pull, source, generate, or invent comps — they come ONLY from the broker. If none
   are provided, ASK; never substitute your own. (Photos optional as a URL/base64.)
+- **Subject property photo (one):** ask the broker to send ONE photo of the subject property
+  for the cover (e.g. "Send a photo of the property for the cover, or say 'skip'."). You never
+  handle image bytes — when the broker sends a photo, the system uploads it and injects its
+  public URL into the conversation. Put that EXACT URL into `subject.photo_url` in the payload.
+  Never ask for a photo again once you've received a URL. If the broker skips, leave
+  `photo_url` empty — the BPO renders fine with a placeholder.
 - **Narratives:** you write these (see GUIDANCE).
 
 When you have the data (and the rent roll is confirmed), confirm the full picture once,
@@ -167,7 +173,8 @@ generated, the broker may send a correction to the one you just built ("change L
     "address_line1": "", "city_state_zip": "", "client_name": "", "market_name": "",
     "asset_type": "", "building_sf": 0, "lot_sf": 0, "acreage": 0, "units": 0,
     "year_built": 0, "tour_date": "YYYY-MM-DD", "asking_price": 0, "list_price": 0,
-    "value_low": 0, "value_high": 0, "market_duration": "", "noi": 0, "opex": 0
+    "value_low": 0, "value_high": 0, "market_duration": "", "noi": 0, "opex": 0,
+    "photo_url": ""
   },
   "tenants": [
     { "suite": "", "name": "", "size_sf": 0, "rent_psf": 0, "annual_rent": 0,

@@ -37,7 +37,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-10-tg-9';
+const VERSION = '2026-06-11-tg-10';
 
 // A chat marked "generating" within this window blocks a second generation (double-gen
 // guard). Beyond it the mark is treated as stale (a truly dead run) and generation may retry.
@@ -400,6 +400,70 @@ async function handleUnsupportedFile(token, chatId, fileName, kind) {
   await sendMessage(token, chatId, `${what}, but I can’t read ${label} yet — type the details and I’ll take it from there.`);
 }
 
+// ---- subject photo: upload to the public Supabase Storage bucket, return the public URL. ----
+const PHOTO_BUCKET = 'brokeros-photos';
+async function uploadPhoto(bytes, key, ext) {
+  const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
+  let r;
+  try {
+    r = await fetch(`${SB_URL}/storage/v1/object/${PHOTO_BUCKET}/${key}`, {
+      method: 'POST',
+      headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': mime, 'x-upsert': 'true' },
+      body: bytes,
+    });
+  } catch (e) { console.error('photo upload error:', (e && e.message) || e); return null; }
+  if (!r.ok) { console.error('photo upload failed:', r.status, await r.text().catch(() => '')); return null; }
+  return `${SB_URL}/storage/v1/object/public/${PHOTO_BUCKET}/${key}`;
+}
+
+// A PHOTO arrived: grab bytes (tg-7), store in the bucket, inject the public URL into the
+// agent session as the SUBJECT photo. Bridge does all file work; agent only places the URL.
+async function handlePhoto(token, chatId, photos) {
+  const stop = startTyping(token, chatId);
+  try {
+    const best = Array.isArray(photos) && photos.length ? photos[photos.length - 1] : null; // largest size
+    const meta = best ? await tgGetFile(token, best.file_id) : null;
+    const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
+    if (!bytes) {
+      await sendMessage(token, chatId, "Couldn’t grab that image from Telegram — send it again.");
+      return;
+    }
+    const ext = ((meta.file_path.match(/\.([A-Za-z0-9]+)$/) || [])[1] || 'jpg').toLowerCase();
+    const url = await uploadPhoto(bytes, `${chatId}/${Date.now()}.${ext}`, ext);
+    if (!url) {
+      await sendMessage(token, chatId, "Couldn’t save that image — try again.");
+      return;
+    }
+    recordUpload(chatId, { name: 'the property photo', kind: 'photo', supported: true, readable: 'images' });
+    await sendMessage(token, chatId, 'Got the property photo.'); // bridge owns the confirmation
+
+    // Inject the URL into the chat's session so the agent puts it in subject.photo_url.
+    let row = await sbGet(chatId);
+    let sessionId;
+    if (!row) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
+    else sessionId = row.session_id;
+
+    const injection = `[The broker uploaded the SUBJECT PROPERTY photo. Its public URL is: ${url}\nUse this EXACT URL as subject.photo_url in the payload. Do not ask for a property photo again. Then continue the flow.]`;
+    const deadline = Date.now() + 200000;
+    let reply;
+    try { reply = await sendTurn(sessionId, injection, deadline); }
+    catch (e) {
+      const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId);
+      reply = await sendTurn(sessionId, injection, deadline);
+    }
+    if (!reply) return; // already confirmed "Got the property photo."
+    const payload = extractGenerate(reply);
+    if (payload) { await runGeneration(token, chatId, payload); return; }
+    await sbTouch(chatId);
+    await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
+  } catch (e) {
+    console.error('handlePhoto error:', (e && e.message) || e);
+    try { await sendMessage(token, chatId, "Hit an error saving that photo — send it again."); } catch { /* ignore */ }
+  } finally {
+    stop();
+  }
+}
+
 export default async function handler(req, res) {
   // Secret-safe Supabase round-trip self-test (GET ?selftest=supabase). Uses the server-side
   // service key already in env (never returned); writes/reads/deletes a sentinel row to prove
@@ -461,7 +525,18 @@ export default async function handler(req, res) {
     return;
   }
 
-  // Other non-text (photo/voice/etc.): acknowledge by type with the actionable fallback.
+  // PHOTO: subject property hero — upload to the bucket and inject the URL (Photos Part 1).
+  if (type === 'photo') {
+    res.status(200).json({ ok: true, version: VERSION, type, mode: 'photo' });
+    if (!sbConfigured()) {
+      waitUntil((async () => { try { await sendMessage(token, chatId, '⚙️ Session store not configured yet — add SUPABASE_URL and SUPABASE_SERVICE_KEY in Vercel and redeploy.'); } catch { /* ignore */ } })());
+      return;
+    }
+    waitUntil(handlePhoto(token, chatId, msg.photo));
+    return;
+  }
+
+  // Other non-text (voice/video/etc.): acknowledge by type with the actionable fallback.
   if (type !== 'text') {
     res.status(200).json({ ok: true, version: VERSION, type, mode: 'unsupported-file' });
     waitUntil(handleUnsupportedFile(token, chatId, null, type));
