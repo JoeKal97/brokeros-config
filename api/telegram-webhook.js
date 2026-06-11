@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-11-tg-11';
+const VERSION = '2026-06-11-tg-12';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -55,6 +55,15 @@ function commitTiming(tm) { if (tm) { tm.total_ms = Date.now() - tm.t0; delete t
 // guard). Beyond it the mark is treated as stale (a truly dead run) and generation may retry.
 const GENERATING_TTL_MS = 240000;
 
+// A delivered BPO stays correctable (post-gen edits) only for this window after delivery/last
+// activity. After it, the session is closed; a new message starts fresh — so e.g. typing "BPO"
+// the next day begins a new BPO instead of resurfacing the old one.
+const DELIVERED_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+function deliveredAgeMs(row) {
+  const t = row && row.last_active ? Date.parse(row.last_active) : NaN;
+  return Number.isFinite(t) ? Date.now() - t : Infinity; // missing timestamp => treat as expired
+}
+
 // Rebuilt agent governed by base workflow + agents/telegram-delivery-contract.md.
 const AGENT_ID = process.env.BROKEROS_AGENT_ID || 'agent_0158kmQA7nKFSB6xRdTSfJ2C';
 const GENERATE_PDF_URL = 'https://brokeros-config.vercel.app/api/generate-pdf';
@@ -64,7 +73,7 @@ const TERMINAL = new Set(['session.status_idle', 'session.status_terminated', 's
 const TG_API = (token, m) => `https://api.telegram.org/bot${token}/${m}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const START_RE = /^\s*\/?(start|new)\b/i;          // "/start", "/new", "new bpo", "new ..."
+const START_RE = /^\s*\/?(start|new|bpo)\b/i;       // "/start", "/new", "new bpo", "start a bpo", bare "BPO"
 const NEWBPO_RE = /\bnew\s*bpo\b/i;
 const END_RE = /^\s*\/?(cancel|done|reset|stop)\b/i;
 const RETRY_RE = /^\s*\/?(retry|resend|try\s*again|again|yes|yep|yeah|yup|ok(ay)?|sure|go|please)\b/i; // after a failed generation
@@ -228,7 +237,7 @@ async function sbPatch(chatId, fields) {
 // without another agent round trip.
 const sbMarkGenerating = (chatId, payload) => sbPatch(chatId, { status: 'generating', generating_since: new Date().toISOString(), last_payload: payload });
 const sbMarkFailed = (chatId) => sbPatch(chatId, { status: 'generate_failed', generating_since: null }); // keep last_payload for retry
-const sbMarkDelivered = (chatId) => sbPatch(chatId, { status: 'delivered', generating_since: null }); // keep session + last_payload for post-delivery edits
+const sbMarkDelivered = (chatId) => sbPatch(chatId, { status: 'delivered', generating_since: null, last_active: new Date().toISOString() }); // keep session + last_payload for post-delivery edits; stamp the window start
 const sbClearState = (chatId) => sbPatch(chatId, { status: null, generating_since: null, last_payload: null });
 
 function isGeneratingActive(row) {
@@ -664,6 +673,15 @@ export default async function handler(req, res) {
         row = { ...row, status: null };
       }
 
+      // EXPIRY: a delivered BPO stays correctable only for DELIVERED_TTL. A non-start message
+      // after that window is poking a long-closed BPO — close it and ask, rather than resurfacing
+      // stale state. (Bare "BPO" / "new BPO" / "start a BPO" are starts and skip this.)
+      if (!wantStart && row && row.status === 'delivered' && deliveredAgeMs(row) > DELIVERED_TTL_MS) {
+        await sbDelete(chatId);
+        await sendMessage(token, chatId, "That BPO session has closed — want me to start a new one? Send \"new BPO\" and we’ll begin.");
+        return;
+      }
+
       // Normal agent turn — typing is already pulsing and the ack was already sent above.
       try {
         // A non-"new BPO" message while a delivered BPO is on file = a post-delivery correction:
@@ -680,8 +698,8 @@ export default async function handler(req, res) {
           sessionId = row.session_id;
         }
 
-        // Bare "/start" or "/new" -> kick the agent's intake; otherwise pass the text through.
-        const toSend = /^\s*\/?(start|new)\s*$/i.test(incoming) ? 'Hi, I need to start a new BPO.' : incoming;
+        // Bare start command ("/start", "/new", "BPO") -> kick the agent's intake; otherwise pass through.
+        const toSend = /^\s*\/?(start|new|bpo)\s*$/i.test(incoming) ? 'Hi, I need to start a new BPO.' : incoming;
 
         const deadline = Date.now() + 200000; // generous; returns as soon as the agent is idle
         let reply;
