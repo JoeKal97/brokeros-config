@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-11-tg-13';
+const VERSION = '2026-06-11-tg-14';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -78,6 +78,7 @@ function deliveredDecision(row, text) {
 const AGENT_ID = process.env.BROKEROS_AGENT_ID || 'agent_0158kmQA7nKFSB6xRdTSfJ2C';
 const GENERATE_PDF_URL = 'https://brokeros-config.vercel.app/api/generate-pdf';
 const PARSE_RENTROLL_URL = 'https://brokeros-config.vercel.app/api/parse-rentroll';
+const PARSE_COMP_URL = 'https://brokeros-config.vercel.app/api/parse-comp-pdf';
 
 const TERMINAL = new Set(['session.status_idle', 'session.status_terminated', 'session.error']);
 const TG_API = (token, m) => `https://api.telegram.org/bot${token}/${m}`;
@@ -134,6 +135,11 @@ function readableType(kind) {
 }
 function isXlsxDoc(doc) {
   return /\.xlsx?$/i.test(doc.file_name || '') || /spreadsheetml|ms-excel/i.test(doc.mime_type || '');
+}
+// A PDF document is treated as an MLS Matrix comp PDF (parse-comp-pdf). Other doc types fall
+// through to the actionable "type it instead" fallback.
+function isCompPdf(doc) {
+  return /\.pdf$/i.test(doc.file_name || '') || /application\/pdf/i.test(doc.mime_type || '');
 }
 
 // ---- message-type routing (unchanged) ----
@@ -434,6 +440,83 @@ async function handleXlsx(token, chatId, doc) {
   }
 }
 
+// ---- MLS Matrix comp PDF: bridge parses (parse-comp-pdf), uploads the photo, injects the comp ----
+async function parseCompPdf(bytes) {
+  const body = new URLSearchParams({ file_base64: bytes.toString('base64') }).toString();
+  let r;
+  try { r = await fetch(PARSE_COMP_URL, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body }); }
+  catch (e) { return { ok: false, detail: String((e && e.message) || e) }; }
+  const j = await r.json().catch(() => null);
+  if (r.ok && j && j.comp) return { ok: true, comp: j.comp, photo_base64: j.photo_base64 || null };
+  return { ok: false, detail: (j && (j.detail || j.error)) || ('HTTP ' + r.status) };
+}
+
+// A comp PDF arrived: download -> parse-comp-pdf -> upload the extracted photo to Supabase ->
+// inject the parsed comp (+ photo_url) into the session. Agent accumulates comps and runs the
+// A6-style COMP CONFIRMATION before any generation. Bridge does ALL file work; agent only
+// places the confirmed comp data + photo_url into the payload (same pattern as xlsx/subject photo).
+async function handleCompPdf(token, chatId, doc) {
+  const stop = startTyping(token, chatId);
+  try {
+    await Promise.all([
+      sendChatAction(token, chatId, 'typing'),
+      sendMessage(token, chatId, `Reading ${doc.file_name || 'that comp PDF'}…`),
+    ]);
+    const meta = await tgGetFile(token, doc.file_id);
+    const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
+    if (!bytes) {
+      recordUpload(chatId, { name: doc.file_name || 'that PDF', kind: 'document', supported: false, readable: 'that file' });
+      await sendMessage(token, chatId, `Got ${doc.file_name || 'your PDF'}, but couldn’t download it from Telegram. Send it again.`);
+      return;
+    }
+    const parsed = await parseCompPdf(bytes);
+    if (!parsed.ok || !parsed.comp) {
+      console.error('parse-comp-pdf failed:', parsed.detail);
+      recordUpload(chatId, { name: doc.file_name || 'that PDF', kind: 'document', supported: false, readable: 'that PDF' });
+      await sendMessage(token, chatId, `Got ${doc.file_name || 'your PDF'}, but I couldn’t read a comp from it${parsed.detail ? ` (${parsed.detail})` : ''}. You can type the comp details instead.`);
+      return;
+    }
+
+    // Upload the extracted photo (if any) -> public URL. Bridge owns file work; agent gets a URL.
+    let photo_url = null;
+    if (parsed.photo_base64) {
+      try { photo_url = await uploadPhoto(Buffer.from(parsed.photo_base64, 'base64'), `${chatId}/comp_${Date.now()}.png`, 'png'); }
+      catch (e) { console.error('comp photo upload error:', (e && e.message) || e); }
+    }
+    const comp = { ...parsed.comp, photo_url };
+    recordUpload(chatId, { name: doc.file_name || 'that comp PDF', kind: 'comp_pdf', supported: true, readable: 'MLS comp PDF' });
+
+    // Resolve/continue the chat's BPO session (accumulate comps across multiple PDFs).
+    let row = await sbGet(chatId);
+    let sessionId;
+    if (!row) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
+    else sessionId = row.session_id;
+
+    const injection =
+      `[The broker uploaded an MLS Matrix comp PDF "${doc.file_name || 'comp.pdf'}". The system has already parsed it for you — do NOT ask them to type it. ADD this comp to any comps you already have for this BPO (the broker may forward several; accumulate them). The comp photo is uploaded; use photo_url EXACTLY as given. Then run the COMP CONFIRMATION step: show ALL comps captured so far in the comp-confirmation block format and ask the broker to confirm before you use them. Do NOT modify, recompute, or invent any field — OCR can slip a digit, which is exactly why the broker confirms.]\n` +
+      `Parsed comp (JSON):\n${JSON.stringify(comp)}`;
+
+    const deadline = Date.now() + 200000;
+    let reply;
+    try { reply = await sendTurn(sessionId, injection, deadline); }
+    catch (e) {
+      const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId);
+      reply = await sendTurn(sessionId, injection, deadline);
+    }
+    if (!reply) { await sendMessage(token, chatId, `Read the comp from ${doc.file_name || 'your PDF'}, but couldn’t get the confirmation back in time. Send it again.`); return; }
+
+    const payload = extractGenerate(reply);
+    if (payload) { await runGeneration(token, chatId, payload); return; }
+    await sbTouch(chatId);
+    await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
+  } catch (e) {
+    console.error('handleCompPdf error:', (e && e.message) || e);
+    try { await sendMessage(token, chatId, `Got ${doc.file_name || 'your PDF'}, but hit an error reading it. You can type the comp details instead.`); } catch { /* ignore */ }
+  } finally {
+    stop();
+  }
+}
+
 // Unsupported upload (non-xlsx doc, photo, voice, etc.): acknowledge it by name, say plainly
 // it can't be read yet, and give the broker the actionable fallback.
 async function handleUnsupportedFile(token, chatId, fileName, kind) {
@@ -583,12 +666,16 @@ export default async function handler(req, res) {
   if (type === 'document') {
     const doc = msg.document;
     const xlsx = isXlsxDoc(doc);
-    res.status(200).json({ ok: true, version: VERSION, type, mode: xlsx ? 'xlsx' : 'unsupported-file' });
-    if (xlsx && !sbConfigured()) {
+    const compPdf = !xlsx && isCompPdf(doc);
+    const mode = xlsx ? 'xlsx' : compPdf ? 'comp-pdf' : 'unsupported-file';
+    res.status(200).json({ ok: true, version: VERSION, type, mode });
+    if ((xlsx || compPdf) && !sbConfigured()) {
       waitUntil((async () => { try { await sendMessage(token, chatId, '⚙️ Session store not configured yet — add SUPABASE_URL and SUPABASE_SERVICE_KEY in Vercel and redeploy.'); } catch { /* ignore */ } })());
       return;
     }
-    waitUntil(xlsx ? handleXlsx(token, chatId, doc) : handleUnsupportedFile(token, chatId, doc.file_name, 'document'));
+    waitUntil(xlsx ? handleXlsx(token, chatId, doc)
+      : compPdf ? handleCompPdf(token, chatId, doc)
+      : handleUnsupportedFile(token, chatId, doc.file_name, 'document'));
     return;
   }
 
