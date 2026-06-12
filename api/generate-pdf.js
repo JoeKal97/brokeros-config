@@ -166,22 +166,51 @@ function buildComps(comps) {
   return out;
 }
 
-// Subject hero: an <img> when a photo URL is present, else the original grey placeholder so a
-// no-photo BPO still renders. PDFShift fetches the public URL when rendering.
+// Subject photos: an <img> when a photo URL is present, else the ORIGINAL grey placeholder for
+// that slot so a no-photo BPO still renders unchanged. PDFShift fetches the public URLs.
 const COVER_PLACEHOLDER =
   '<div class="cover-photo-placeholder">' +
   '<svg width="60" height="60" viewBox="0 0 24 24" fill="currentColor"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>' +
   '<span>Property Photo</span></div>';
-function subjectPhoto(url) {
+// Per-slot placeholders — must match the template's original markup so no-photo BPOs are identical.
+const SLOT_PLACEHOLDERS = {
+  exec: '<div class="exec-photo-placeholder">Property Photo — Aerial View</div>',
+  val: '<div class="val-col-right-photo-placeholder">Property Photo</div>',
+  divider: '<div class="divider-photo-placeholder">Property Photo</div>',
+  comps: '<div class="comp-photo-ph">Subject Photo</div>',
+};
+function slotPhoto(url, placeholder) {
   return (url && /^https?:\/\//i.test(String(url)))
     ? '<img src="' + esc(url) + '" alt="Subject property" style="width:100%;height:100%;object-fit:cover;display:block;" />'
-    : COVER_PLACEHOLDER;
+    : placeholder;
+}
+// Collect the subject photo URLs from the payload (photo_urls[] preferred; photo_url is the
+// single-photo back-compat). Returns http(s) URLs only, in order (index 0 = the cover hero).
+function subjectPhotoUrls(s) {
+  let urls = Array.isArray(s.photo_urls) ? s.photo_urls : (s.photo_url ? [s.photo_url] : []);
+  return urls.filter((u) => u && /^https?:\/\//i.test(String(u)));
+}
+// Distribute the uploaded subject photos across the 9 subject-photo slots. cover = hero (index 0);
+// the other 8 slots cycle through the photos (starting at index 1 so extras get showcased, then
+// REUSING photos so a photo'd BPO never shows grey boxes). No photos -> every slot placeholders.
+function distributeSubjectPhotos(urls) {
+  const slot = { cover: null, exec: null, val: null, div: [null, null, null, null, null], comps: null };
+  if (!urls.length) return slot;
+  slot.cover = urls[0];
+  let i = urls.length > 1 ? 1 : 0;
+  const next = () => urls[i++ % urls.length];
+  slot.exec = next();
+  slot.val = next();
+  for (let d = 0; d < 5; d++) slot.div[d] = next();
+  slot.comps = next();
+  return slot;
 }
 
 // ---- Build the full {{VARIABLE}} map from the payload -----------------------
 function buildVars(payload, broker) {
   const s = payload.subject || {};
   const nar = payload.narratives || {};
+  const sp = distributeSubjectPhotos(subjectPhotoUrls(s)); // subject photos across the 9 slots
   const building_sf = num(s.building_sf);
   const asking = num(s.asking_price);
   const list = isNum(num(s.list_price)) ? num(s.list_price) : asking;
@@ -216,7 +245,15 @@ function buildVars(payload, broker) {
     SUBJECT_ADDRESS: esc(s.address_line1), SUBJECT_CITY_STATE: esc(s.city_state_zip),
     SUBJECT_PRICE: money(asking), SUBJECT_BLDG_SF: sfUnit(building_sf), SUBJECT_LOT_SF: sfUnit(lot_sf),
     SUBJECT_UNITS: intf(num(s.units)), SUBJECT_CAP: pct(capRate, 2), SUBJECT_YEAR: yearf(num(s.year_built)),
-    SUBJECT_PHOTO: subjectPhoto(s.photo_url),
+    SUBJECT_PHOTO: slotPhoto(sp.cover, COVER_PLACEHOLDER),
+    EXEC_PHOTO: slotPhoto(sp.exec, SLOT_PLACEHOLDERS.exec),
+    VAL_PHOTO: slotPhoto(sp.val, SLOT_PLACEHOLDERS.val),
+    DIVIDER_PHOTO_1: slotPhoto(sp.div[0], SLOT_PLACEHOLDERS.divider),
+    DIVIDER_PHOTO_2: slotPhoto(sp.div[1], SLOT_PLACEHOLDERS.divider),
+    DIVIDER_PHOTO_3: slotPhoto(sp.div[2], SLOT_PLACEHOLDERS.divider),
+    DIVIDER_PHOTO_4: slotPhoto(sp.div[3], SLOT_PLACEHOLDERS.divider),
+    DIVIDER_PHOTO_5: slotPhoto(sp.div[4], SLOT_PLACEHOLDERS.divider),
+    COMPS_SUBJECT_PHOTO: slotPhoto(sp.comps, SLOT_PLACEHOLDERS.comps),
     DEMOGRAPHICS_ROWS: "<tr><td colspan='4'>Demographic data available upon request.</td></tr>",
     POPULATION_ROWS: "<tr><td colspan='4'>Population data available upon request.</td></tr>",
     HOUSEHOLD_ROWS: "<tr><td colspan='4'>Household &amp; income data available upon request.</td></tr>"

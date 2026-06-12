@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-11-tg-14';
+const VERSION = '2026-06-11-tg-15';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -580,7 +580,7 @@ async function handlePhoto(token, chatId, photos) {
     if (!row) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
     else sessionId = row.session_id;
 
-    const injection = `[The broker uploaded the SUBJECT PROPERTY photo. Its public URL is: ${url}\nUse this EXACT URL as subject.photo_url in the payload. Do not ask for a property photo again. Then continue the flow.]`;
+    const injection = `[The broker uploaded a SUBJECT PROPERTY photo. Its public URL is: ${url}\nAPPEND this URL to subject.photo_urls in the payload — an ORDERED array of subject photo URLs. The FIRST photo received is the cover hero; later ones are additional property shots the server distributes across the BPO (exec summary, section dividers, comps subject row). KEEP any URLs already in subject.photo_urls and add this one to the end. Never drop earlier photos. Do not ask for the cover photo again. Then continue the flow.]`;
     const deadline = Date.now() + 200000;
     let reply;
     try { reply = await sendTurn(sessionId, injection, deadline); }

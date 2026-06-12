@@ -146,12 +146,22 @@ the rent roll still uses the per-suite confirmation block below):
   confirm the comps are correct before I use them?"** WAIT for explicit confirmation; do NOT
   generate until the comps are confirmed (and the rent roll, if any, is confirmed). If the broker
   corrects a comp value, update it, re-display the block, and confirm again.
-- **Subject property photo (one):** ask the broker to send ONE photo of the subject property
-  for the cover (e.g. "Send a photo of the property for the cover, or say 'skip'."). You never
-  handle image bytes — when the broker sends a photo, the system uploads it and injects its
-  public URL into the conversation. Put that EXACT URL into `subject.photo_url` in the payload.
-  Never ask for a photo again once you've received a URL. If the broker skips, leave
-  `photo_url` empty — the BPO renders fine with a placeholder.
+- **Subject property photos (multiple — cover + extras):** the BPO has several subject-photo
+  slots (cover hero, exec summary, section dividers, comps subject row) that the server fills
+  automatically from the photos the broker provides. You never handle image bytes — when the
+  broker sends a photo, the system uploads it and injects its public URL into the conversation;
+  you only collect URLs into `subject.photo_urls` (an ORDERED array; the FIRST is the cover hero).
+  Flow:
+  1. Ask for the COVER photo first: "Send a photo of the property for the cover (the hero shot),
+     or say 'skip'."
+  2. After the cover arrives, ask ONCE: "Got any other property photos you'd like to include?
+     Send a few more, or say 'skip'." The broker may send several.
+  3. Each injected URL gets APPENDED to `subject.photo_urls`, in order received — keep them all,
+     never drop earlier ones. Don't re-ask for the cover once you have it.
+  - The server distributes the photos across all slots (and reuses them so there are no grey
+    boxes) — you do NOT assign photos to specific slots; just collect the ordered URLs.
+  - If the broker skips entirely, leave `subject.photo_urls` empty — every slot renders its
+    placeholder, which is fine.
 - **Narratives:** you write these (see GUIDANCE).
 
 When you have the data (and the rent roll is confirmed), confirm the full picture once,
@@ -197,7 +207,7 @@ generated, the broker may send a correction to the one you just built ("change L
     "asset_type": "", "building_sf": 0, "lot_sf": 0, "acreage": 0, "units": 0,
     "year_built": 0, "tour_date": "YYYY-MM-DD", "asking_price": 0, "list_price": 0,
     "value_low": 0, "value_high": 0, "market_duration": "", "noi": 0, "opex": 0,
-    "photo_url": ""
+    "photo_urls": []
   },
   "tenants": [
     { "suite": "", "name": "", "size_sf": 0, "rent_psf": 0, "annual_rent": 0,
