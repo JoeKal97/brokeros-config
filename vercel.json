@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "api/parse-comp-pdf.js": {
+      "maxDuration": 60,
+      "includeFiles": "{api/tessdata/**,node_modules/tesseract.js-core/**,node_modules/mupdf/dist/**}"
+    }
+  }
+}

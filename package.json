@@ -6,6 +6,8 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.1",
     "@vercel/functions": "^3.7.0",
+    "mupdf": "^1.27.0",
+    "tesseract.js": "^6.0.1",
     "xlsx": "^0.18.5"
   }
 }
