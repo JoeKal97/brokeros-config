@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-11-tg-15';
+const VERSION = '2026-06-11-tg-16';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -101,8 +101,9 @@ const CONFIRM_RE = /^\s*(looks?\s+good|that'?s?\s+(right|correct|it|good)|correc
 // from what we actually received, not a generic status line.
 const FILE_STATUS_RE = /(did|do)\s+you\s+(get|got|have|receive|see)\b|\byou\s+(get|got|receive)\s+(it|that|the|my)\b|\b(get|got)\s+(the|my)\s+(file|upload|spreadsheet|rent\s*roll|doc|sheet)\b|\bcome\s+through\b/i;
 
-// Varied "processing" acks for substantive DATA turns (rotated, no back-to-back repeat).
-const DATA_ACKS = ['On it…', 'Got it, one sec…', 'Working on that…', 'Let me pull that together…', 'Got it — give me a moment…'];
+// Neutral, non-assertive acks for HEAVY data turns only (rotated, no back-to-back repeat).
+// Warm acknowledgment, no claim of work-in-progress ("working on that" overstated the machinery).
+const DATA_ACKS = ['Got it…', 'Got it — one sec…', 'Thanks — give me a moment…', 'Got that…', 'One moment…'];
 let lastAckIdx = -1;
 function pickAck() {
   let i = Math.floor(Math.random() * DATA_ACKS.length);
@@ -110,13 +111,28 @@ function pickAck() {
   lastAckIdx = i;
   return DATA_ACKS[i];
 }
-// Classify the inbound text for ack purposes: 'status' | 'confirm' | 'data'.
+// INFORMATIONAL / holding messages — the broker is telling us something or asking us to wait,
+// NOT requesting work ("I have 2 more comps", "more coming", "give me a sec", "hold on"). These
+// must NOT get a canned work-ack — the typing indicator + the agent's real reply carry it.
+const INFO_RE = new RegExp([
+  '^\\s*(hold\\s*(on|up)|hang\\s*on|one\\s*(sec|second|moment|min(ute)?)|just\\s*a\\s*(sec(ond)?|moment|min(ute)?)|give\\s*me\\s*(a\\s*)?(sec(ond)?|min(ute)?|moment)|bear\\s*with(\\s*me)?|stand\\s*by|wait\\b|almost\\s+(done|ready|there))',
+  '\\b((a\\s+)?(few|couple|some|\\d+)\\s+more|more)\\s+(comps?|photos?|pics?|pictures?|docs?|files?|coming|to\\s+(come|send|follow)|on\\s+the\\s+way)\\b',
+  '\\bmore\\s+(coming|to\\s+(come|send|follow)|on\\s+the\\s+way)\\b',
+  '\\b\\d+\\s+more\\b',
+].join('|'), 'i');
+
+// Classify the inbound text for ACK purposes only: 'status' (answered directly) | 'data' (heavy
+// turn -> a neutral canned ack helps) | 'info' (everything else -> typing indicator only; the
+// agent's real reply does the talking). A misfit canned ack reads more robotic than honest typing.
 function classifyAck(text) {
   const t = String(text || '').trim();
   if (STATUS_RE.test(t) || FILE_STATUS_RE.test(t)) return 'status';
+  if (INFO_RE.test(t) || CONFIRM_RE.test(t)) return 'info';
+  // Canned ack ONLY for a genuinely heavy data turn (long / multi-line paste the agent takes real
+  // time on). Short and medium messages ride the typing indicator + the agent's fast reply.
   const words = t.split(/\s+/).filter(Boolean).length;
-  if (CONFIRM_RE.test(t) || (words <= 4 && t.length < 40)) return 'confirm';
-  return 'data';
+  const heavy = t.length > 140 || /\n/.test(t) || words > 24;
+  return heavy ? 'data' : 'info';
 }
 
 // Remember the most recent inbound file per chat (module scope persists across warm
@@ -393,6 +409,12 @@ async function parseRentRoll(bytes) {
 async function handleXlsx(token, chatId, doc) {
   const stop = startTyping(token, chatId);
   try {
+    // Instant ack BEFORE the getFile + parse-rentroll round-trip, so the broker isn't met with
+    // silence while the file is parsed (same pattern as photo/comp-PDF uploads).
+    await Promise.all([
+      sendChatAction(token, chatId, 'typing'),
+      sendMessage(token, chatId, 'Got it — let me look that over…'),
+    ]);
     const meta = await tgGetFile(token, doc.file_id);
     const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
     if (!bytes) {
