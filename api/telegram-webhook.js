@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-11-tg-17';
+const VERSION = '2026-06-11-tg-18';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -88,6 +88,10 @@ const START_RE = /^\s*\/?(start|new|bpo)\b/i;       // "/start", "/new", "new bp
 const NEWBPO_RE = /\bnew\s*bpo\b/i;
 const END_RE = /^\s*\/?(cancel|done|reset|stop)\b/i;
 const RETRY_RE = /^\s*\/?(retry|resend|try\s*again|again|yes|yep|yeah|yup|ok(ay)?|sure|go|please)\b/i; // after a failed generation
+
+// Explicit "make the BPO now" intent -> acknowledge the BUILD immediately (don't wait ~1 min for
+// the agent to decide). Deliberately narrow (clear generate verbs) to avoid firing on plain confirms.
+const GENERATE_INTENT_RE = /\b(generate|build|create|produce|finali[sz]e)\b[^.!?]*\b(bpo|report|pdf|it|this|that)\b|^\s*\/?(generate|build\s*it|make\s*it|create\s*it|generate\s+(the\s+)?bpo|build\s+(the\s+)?bpo|make\s+(the\s+)?bpo|run\s*it|send\s*it|go\s*for\s*it|let'?s\s*go|fire\s*away)\s*$/i;
 
 // STATUS check-in ("you there?", "where's my PDF", "any update", "done yet?") -> answer with
 // real status, not a generic ack.
@@ -287,7 +291,24 @@ function isGeneratingActive(row) {
 // passed the guard and each reached runGeneration. The lock now covers the WHOLE turn (thinking +
 // building). It is `generating_since` recency, taken at TURN START, auto-expiring after
 // GENERATING_TTL_MS so a crashed/failed turn never leaves the chat permanently "busy".
-const BUSY_MSG = 'Still working on your last message — give me a moment and I’ll get to this.';
+// Varied, context-aware "busy"/queued lines (rotated, no back-to-back repeat) so a chat under
+// poking doesn't echo one robotic string. building = a PDF is rendering; working = a turn is
+// mid-flight (deciding); queued = a file arrived while busy and will be processed next.
+const _rotLast = {};
+function rotate(key, arr) {
+  let i = Math.floor(Math.random() * arr.length);
+  if (arr.length > 1 && i === _rotLast[key]) i = (i + 1) % arr.length;
+  _rotLast[key] = i;
+  return arr[i];
+}
+const BUSY_BUILDING = ['Still building your BPO — about 30 seconds…', 'Putting your BPO together now — nearly there…', 'Still rendering the BPO — just a moment…'];
+const BUSY_WORKING = ['One sec — just finishing your last message…', 'Hang tight — wrapping up the last thing…', 'Almost through the previous step — a moment…'];
+const FILE_QUEUED = ['Got that — I’ll add it right after this…', 'Got it — I’ll grab this once the last one’s done…', 'Received — I’ll process it in a moment…'];
+function busyLine(row) {
+  return (row && row.status === 'generating') ? rotate('build', BUSY_BUILDING) : rotate('work', BUSY_WORKING);
+}
+const pickFileQueued = () => rotate('file', FILE_QUEUED);
+
 function lockHeld(row) {
   const since = row && row.generating_since ? Date.parse(row.generating_since) : 0;
   return Number.isFinite(since) && since > 0 && (Date.now() - since) < GENERATING_TTL_MS;
@@ -309,17 +330,31 @@ async function sbAcquireLock(chatId) {
 }
 const sbReleaseLock = (chatId) => sbPatch(chatId, { generating_since: null });
 
-// File handlers run an agent turn too (inject parsed data -> agent confirms), so they share the
-// same lock. The upload may be the FIRST message, so ensure a session row exists before acquiring.
-// Returns true if the lock was taken (caller MUST sbReleaseLock in finally), false if the chat is busy.
-async function takeLockEnsuringRow(chatId) {
+// File-handler gate: ensure the session row exists, then take the turn lock — but QUEUE (wait) if
+// another turn is in flight, so a BATCH of comp PDFs / photos all get processed instead of being
+// rejected. File ingest never generates, so serializing it (one turn at a time, in arrival order)
+// is safe and keeps the Managed Agent session consistent while still accumulating every file.
+// Sends the right ack: the normal instant ack if the lock is free now, or a "queued" ack if it had
+// to wait. Returns true if the lock is held (caller processes + releases), false on timeout
+// (already told the broker to resend).
+const FILE_QUEUE_WAIT_MS = 120000;
+async function fileGateAcquire(token, chatId, instantAck) {
   let row = await sbGet(chatId);
-  if (!row) {
-    try { const s = await newSession(); await sbUpsert(chatId, s.id, s.envId); } catch { /* ignore */ }
-    row = await sbGet(chatId);
+  if (!row) { try { const s = await newSession(); await sbUpsert(chatId, s.id, s.envId); } catch { /* ignore */ } }
+  if (await sbAcquireLock(chatId)) {                 // free now -> normal instant ack, process immediately
+    await Promise.all([sendChatAction(token, chatId, 'typing'), sendMessage(token, chatId, instantAck)]);
+    return true;
   }
-  if (lockHeld(row)) return false;
-  return await sbAcquireLock(chatId);
+  // Busy: a turn is in flight. Tell the broker this file is queued, then WAIT for the lock so it
+  // gets processed next (not dropped). The lock auto-expires (TTL) so this can't wait forever.
+  await sendMessage(token, chatId, pickFileQueued());
+  const deadline = Date.now() + FILE_QUEUE_WAIT_MS;
+  while (Date.now() < deadline) {
+    await sleep(2500);
+    if (await sbAcquireLock(chatId)) return true;
+  }
+  await sendMessage(token, chatId, 'Still tied up finishing the last one — send that file again in a moment and I’ll grab it.');
+  return false;
 }
 
 // Answer a STATUS check-in with the real state — never a generic ack. (Mid-generation is
@@ -409,9 +444,9 @@ async function generatePdf(payload) {
 
 // Bridge owns ALL "building / sent / failed" messaging, driven by real results. The agent
 // never speaks to delivery. On failure we keep the stashed payload so a retry can re-run.
-async function runGeneration(token, chatId, payload) {
-  await sbMarkGenerating(chatId, payload);                 // stash payload + block resends
-  await sendMessage(token, chatId, 'Building your BPO now ⏳');
+async function runGeneration(token, chatId, payload, opts = {}) {
+  await sbMarkGenerating(chatId, payload);                 // stash payload + extend the turn lock
+  if (!opts.ackedBuilding) await sendMessage(token, chatId, 'Building your BPO now ⏳'); // skip if already acked on generate-intent
   const result = await generatePdf(payload);
 
   if (result.ok) {
@@ -454,16 +489,10 @@ async function handleXlsx(token, chatId, doc) {
   const stop = startTyping(token, chatId);
   let lockTaken = false;
   try {
-    // Serialize with any in-flight turn: a rent roll arriving mid-turn must not start a concurrent
-    // session turn. Busy -> ask to resend (no parse, no second turn).
-    if (!(await takeLockEnsuringRow(chatId))) { await sendMessage(token, chatId, BUSY_MSG); return; }
-    lockTaken = true;
-    // Instant ack BEFORE the getFile + parse-rentroll round-trip, so the broker isn't met with
-    // silence while the file is parsed (same pattern as photo/comp-PDF uploads).
-    await Promise.all([
-      sendChatAction(token, chatId, 'typing'),
-      sendMessage(token, chatId, 'Got it — let me look that over…'),
-    ]);
+    // Queue behind any in-flight turn (don't reject) so batched uploads all process. fileGateAcquire
+    // sends the instant ack (free now) or a "queued" ack (waited). File ingest never generates.
+    lockTaken = await fileGateAcquire(token, chatId, 'Got it — let me look that over…');
+    if (!lockTaken) return;
     const meta = await tgGetFile(token, doc.file_id);
     const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
     if (!bytes) {
@@ -531,13 +560,9 @@ async function handleCompPdf(token, chatId, doc) {
   const stop = startTyping(token, chatId);
   let lockTaken = false;
   try {
-    // Serialize with any in-flight turn (busy -> ask to resend; no parse, no concurrent turn).
-    if (!(await takeLockEnsuringRow(chatId))) { await sendMessage(token, chatId, BUSY_MSG); return; }
-    lockTaken = true;
-    await Promise.all([
-      sendChatAction(token, chatId, 'typing'),
-      sendMessage(token, chatId, `Reading ${doc.file_name || 'that comp PDF'}…`),
-    ]);
+    // Queue behind any in-flight turn (don't reject) so a batch of comp PDFs all accumulate.
+    lockTaken = await fileGateAcquire(token, chatId, `Reading ${doc.file_name || 'that comp PDF'}…`);
+    if (!lockTaken) return;
     const meta = await tgGetFile(token, doc.file_id);
     const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
     if (!bytes) {
@@ -626,15 +651,9 @@ async function handlePhoto(token, chatId, photos) {
   const stop = startTyping(token, chatId);
   let lockTaken = false;
   try {
-    // Serialize with any in-flight turn (a photo arriving mid-turn must not start a concurrent
-    // session turn). Busy -> ask to resend; no upload, no second turn.
-    if (!(await takeLockEnsuringRow(chatId))) { await sendMessage(token, chatId, BUSY_MSG); return; }
-    lockTaken = true;
-    // FIX 4: instant ack BEFORE getFile/download/upload, in parallel with the typing pulse.
-    await Promise.all([
-      sendChatAction(token, chatId, 'typing'),
-      sendMessage(token, chatId, 'Got it — saving that photo…'),
-    ]);
+    // Queue behind any in-flight turn (don't reject) so batched photos all process + distribute.
+    lockTaken = await fileGateAcquire(token, chatId, 'Got it — saving that photo…');
+    if (!lockTaken) return;
     mark(_tm, 'ackSent');
 
     const best = Array.isArray(photos) && photos.length ? photos[photos.length - 1] : null; // largest size
@@ -826,15 +845,17 @@ export default async function handler(req, res) {
       }
 
       const ackKind = classifyAck(incoming);
+      const genIntent = GENERATE_INTENT_RE.test(incoming);
+      let buildAcked = false;
 
-      // FIX 1+3: fire the typing indicator + (for data turns) the text ack IMMEDIATELY and in
-      // PARALLEL — before any Supabase/agent work. classifyAck is pure string work; it needs no
-      // row. Status check-ins get no ack (they're answered directly below).
+      // Fire the typing indicator + (for heavy data turns) the text ack IMMEDIATELY and in PARALLEL,
+      // before any Supabase/agent work. Generate-intent does NOT ack here — its build ack fires once
+      // we actually hold the turn lock (below), so it never double-messages when the chat is busy.
       if (ackKind !== 'status') {
         stopTyping = startTyping(token, chatId);
         await Promise.all([
           sendChatAction(token, chatId, 'typing'),
-          ackKind === 'data' ? sendMessage(token, chatId, pickAck()) : Promise.resolve(),
+          (ackKind === 'data' && !genIntent) ? sendMessage(token, chatId, pickAck()) : Promise.resolve(),
         ]);
         mark(_tm, 'ackSent');
       }
@@ -848,7 +869,7 @@ export default async function handler(req, res) {
       // start a second turn; give the busy response. (The atomic acquire below covers the race
       // where a concurrent message read the row before the lock was set.)
       if (lockHeld(row)) {
-        await sendMessage(token, chatId, BUSY_MSG);
+        await sendMessage(token, chatId, busyLine(row)); // context-aware: "still building ~30s" vs "finishing your last message"
         return;
       }
 
@@ -872,16 +893,19 @@ export default async function handler(req, res) {
       // the DB lock here and locks itself once its session row exists (in the fresh-start branch).
       let lockTaken = false;
       if (row) {
-        if (!(await sbAcquireLock(chatId))) { await sendMessage(token, chatId, BUSY_MSG); return; }
+        if (!(await sbAcquireLock(chatId))) { await sendMessage(token, chatId, busyLine(row)); return; }
         lockTaken = true;
       }
       try {
+      // Generate-intent: we now hold the turn lock and will run the turn -> acknowledge the BUILD
+      // immediately rather than leaving the broker on the generic line while the agent decides.
+      if (genIntent) { await sendMessage(token, chatId, 'Got it — building your BPO now ⏳'); buildAcked = true; }
       // RETRY after a failed generation: re-run the stashed payload directly (no agent round
       // trip, no reliance on the agent re-emitting). Any other message clears the failed state
       // and routes to the agent normally (so the broker can also correct data instead).
       if (row && row.status === 'generate_failed' && row.last_payload) {
         if (RETRY_RE.test(incoming)) {
-          await runGeneration(token, chatId, row.last_payload); // typing already pulsing
+          await runGeneration(token, chatId, row.last_payload, { ackedBuilding: buildAcked }); // typing already pulsing
           return;
         }
         await sbClearState(chatId); // not a retry -> fall through to a normal agent turn
@@ -940,7 +964,7 @@ export default async function handler(req, res) {
         // Generation signal? Hand the payload to the bridge — it owns building/sent/failed.
         const payload = extractGenerate(reply);
         if (payload) {
-          await runGeneration(token, chatId, payload);
+          await runGeneration(token, chatId, payload, { ackedBuilding: buildAcked });
           return;
         }
 

@@ -172,16 +172,25 @@ then generate.
 ## CORRECTIONS & VALIDATION
 **Validate every value the broker corrects or supplies — apply the SAME cross-field sanity
 reasoning you apply to source data. Never let an internally-inconsistent rent row pass the
-confirmation silently.**
-- Rent roll: `rent_psf × size_sf` should ≈ `annual_rent` (within ~2%). Before accepting a
-  corrected rent, check it. If it fails, FLAG it instead of accepting — show the math and
-  suggest the value implied by the related fields (`annual_rent ÷ size_sf`).
-  - Example: broker corrects a 1,200 SF suite (annual rent $20,340 on file) to "16950".
-    16,950 × 1,200 = $20,340,000/yr, not $20,340. Reply: *"That gives $20,340,000/yr, but the
-    annual rent on file is $20,340 — did you mean $16.95?"* Only accept once it's consistent or
-    the broker explicitly confirms the odd value is intentional.
-- Use the same approach wherever a cross-check exists (e.g. NOI roughly vs. rents − opex) —
-  sanity-check, don't blindly accept a number that contradicts the others.
+confirmation silently, and never SILENTLY change a value.**
+
+- **Anchoring reconciliation (rent roll).** `annual_rent` (with `size_sf`) is the ANCHOR;
+  `rent_psf` is derived and must satisfy `rent_psf × size_sf ≈ annual_rent` (within ~2%). When a
+  supplied/corrected value is internally inconsistent, do these three things in order:
+  1. **RECONCILE** against the anchor — compute the value the anchoring data forces
+     (`annual_rent ÷ size_sf`).
+  2. **STATE the correction WITH the math** — show the arithmetic, not just the answer.
+  3. **RE-DISPLAY** the affected line and let the confirmation step stand for any objection.
+  - Required pattern (do it this way): broker enters "16950" for a 1,200 SF suite whose annual
+    rent on file is $20,340. 16,950 × 1,200 = $20,340,000/yr — impossible against $20,340/yr;
+    $20,340 ÷ 1,200 = $16.95/SF. Say: *"Taking Lulu's as $16.95/SF — consistent with $20,340/yr
+    on 1,200 SF (16,950 would be $20.3M/yr). Re-confirm?"* then re-display and wait.
+  - **Deriving the value the data forces is NOT guessing** (inventing data with no basis stays
+    banned). The difference: a derived value is ALWAYS shown with its reasoning and goes through
+    the confirmation step — it is never applied silently. If the data is genuinely ambiguous (no
+    anchor to reconcile against), ASK rather than derive.
+- Use the same reconcile → state → confirm approach wherever a cross-check exists (e.g. NOI ≈
+  rents − opex) — never blindly accept a number that contradicts the others.
 
 **Post-delivery corrections (edit + regenerate — do NOT restart):** after a BPO has been
 generated, the broker may send a correction to the one you just built ("change Lulu's rent to
