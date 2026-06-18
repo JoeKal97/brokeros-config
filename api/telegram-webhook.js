@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-11-tg-16';
+const VERSION = '2026-06-11-tg-17';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -270,12 +270,56 @@ async function sbPatch(chatId, fields) {
 const sbMarkGenerating = (chatId, payload) => sbPatch(chatId, { status: 'generating', generating_since: new Date().toISOString(), last_payload: payload });
 const sbMarkFailed = (chatId) => sbPatch(chatId, { status: 'generate_failed', generating_since: null }); // keep last_payload for retry
 const sbMarkDelivered = (chatId) => sbPatch(chatId, { status: 'delivered', generating_since: null, last_active: new Date().toISOString() }); // keep session + last_payload for post-delivery edits; stamp the window start
-const sbClearState = (chatId) => sbPatch(chatId, { status: null, generating_since: null, last_payload: null });
+// Clear BPO state on a fresh start / failed-clear. MUST NOT touch generating_since — that field
+// is the per-chat TURN LOCK (owned by sbAcquireLock/sbReleaseLock); nulling it mid-turn would
+// release the lock early and reopen the double-fire window.
+const sbClearState = (chatId) => sbPatch(chatId, { status: null, last_payload: null });
 
 function isGeneratingActive(row) {
   if (!row || row.status !== 'generating') return false;
   const since = row.generating_since ? Date.parse(row.generating_since) : 0;
   return Number.isFinite(since) && since > 0 && (Date.now() - since) < GENERATING_TTL_MS;
+}
+
+// ---- PER-CHAT TURN LOCK (serializes in-flight turns) ----
+// The triple-fire bug: the old guard only tripped once a PDF build STARTED, but the agent turn
+// that DECIDES to generate runs 10-30s earlier — an unguarded window where several messages each
+// passed the guard and each reached runGeneration. The lock now covers the WHOLE turn (thinking +
+// building). It is `generating_since` recency, taken at TURN START, auto-expiring after
+// GENERATING_TTL_MS so a crashed/failed turn never leaves the chat permanently "busy".
+const BUSY_MSG = 'Still working on your last message — give me a moment and I’ll get to this.';
+function lockHeld(row) {
+  const since = row && row.generating_since ? Date.parse(row.generating_since) : 0;
+  return Number.isFinite(since) && since > 0 && (Date.now() - since) < GENERATING_TTL_MS;
+}
+// Atomically take the lock via a CONDITIONAL update — acquire only if the lock is free or expired.
+// Postgres re-checks the WHERE clause on the row it locks, so exactly one of N concurrent callers
+// wins (the rest get 0 rows back = busy). Requires the row to exist. On an unexpected error it
+// degrades to "acquired" so the bot never hangs on a lock it can't read.
+async function sbAcquireLock(chatId) {
+  const now = new Date().toISOString();
+  const cutoff = new Date(Date.now() - GENERATING_TTL_MS).toISOString();
+  const url = `${SB_URL}/rest/v1/telegram_sessions?telegram_chat_id=eq.${chatId}&or=(generating_since.is.null,generating_since.lt.${encodeURIComponent(cutoff)})`;
+  let r;
+  try { r = await fetch(url, { method: 'PATCH', headers: { ...sbHeaders(), Prefer: 'return=representation' }, body: JSON.stringify({ generating_since: now }) }); }
+  catch { return true; }          // network error -> don't hard-block the broker
+  if (!r.ok) return true;         // unexpected -> degrade to no-lock rather than a stuck "busy"
+  const rows = await r.json().catch(() => []);
+  return Array.isArray(rows) && rows.length > 0;
+}
+const sbReleaseLock = (chatId) => sbPatch(chatId, { generating_since: null });
+
+// File handlers run an agent turn too (inject parsed data -> agent confirms), so they share the
+// same lock. The upload may be the FIRST message, so ensure a session row exists before acquiring.
+// Returns true if the lock was taken (caller MUST sbReleaseLock in finally), false if the chat is busy.
+async function takeLockEnsuringRow(chatId) {
+  let row = await sbGet(chatId);
+  if (!row) {
+    try { const s = await newSession(); await sbUpsert(chatId, s.id, s.envId); } catch { /* ignore */ }
+    row = await sbGet(chatId);
+  }
+  if (lockHeld(row)) return false;
+  return await sbAcquireLock(chatId);
 }
 
 // Answer a STATUS check-in with the real state — never a generic ack. (Mid-generation is
@@ -408,7 +452,12 @@ async function parseRentRoll(bytes) {
 // agent goes straight to the per-suite confirmation (broker never types an uploaded rent roll).
 async function handleXlsx(token, chatId, doc) {
   const stop = startTyping(token, chatId);
+  let lockTaken = false;
   try {
+    // Serialize with any in-flight turn: a rent roll arriving mid-turn must not start a concurrent
+    // session turn. Busy -> ask to resend (no parse, no second turn).
+    if (!(await takeLockEnsuringRow(chatId))) { await sendMessage(token, chatId, BUSY_MSG); return; }
+    lockTaken = true;
     // Instant ack BEFORE the getFile + parse-rentroll round-trip, so the broker isn't met with
     // silence while the file is parsed (same pattern as photo/comp-PDF uploads).
     await Promise.all([
@@ -458,6 +507,7 @@ async function handleXlsx(token, chatId, doc) {
     console.error('handleXlsx error:', (e && e.message) || e);
     try { await sendMessage(token, chatId, `Got ${doc.file_name || 'your file'}, but hit an error processing it. Type the rent roll and I’ll continue.`); } catch { /* ignore */ }
   } finally {
+    if (lockTaken) await sbReleaseLock(chatId);
     stop();
   }
 }
@@ -479,7 +529,11 @@ async function parseCompPdf(bytes) {
 // places the confirmed comp data + photo_url into the payload (same pattern as xlsx/subject photo).
 async function handleCompPdf(token, chatId, doc) {
   const stop = startTyping(token, chatId);
+  let lockTaken = false;
   try {
+    // Serialize with any in-flight turn (busy -> ask to resend; no parse, no concurrent turn).
+    if (!(await takeLockEnsuringRow(chatId))) { await sendMessage(token, chatId, BUSY_MSG); return; }
+    lockTaken = true;
     await Promise.all([
       sendChatAction(token, chatId, 'typing'),
       sendMessage(token, chatId, `Reading ${doc.file_name || 'that comp PDF'}…`),
@@ -535,6 +589,7 @@ async function handleCompPdf(token, chatId, doc) {
     console.error('handleCompPdf error:', (e && e.message) || e);
     try { await sendMessage(token, chatId, `Got ${doc.file_name || 'your PDF'}, but hit an error reading it. You can type the comp details instead.`); } catch { /* ignore */ }
   } finally {
+    if (lockTaken) await sbReleaseLock(chatId);
     stop();
   }
 }
@@ -569,7 +624,12 @@ async function uploadPhoto(bytes, key, ext) {
 async function handlePhoto(token, chatId, photos) {
   const _tm = newTiming('photo', chatId);
   const stop = startTyping(token, chatId);
+  let lockTaken = false;
   try {
+    // Serialize with any in-flight turn (a photo arriving mid-turn must not start a concurrent
+    // session turn). Busy -> ask to resend; no upload, no second turn.
+    if (!(await takeLockEnsuringRow(chatId))) { await sendMessage(token, chatId, BUSY_MSG); return; }
+    lockTaken = true;
     // FIX 4: instant ack BEFORE getFile/download/upload, in parallel with the typing pulse.
     await Promise.all([
       sendChatAction(token, chatId, 'typing'),
@@ -620,6 +680,7 @@ async function handlePhoto(token, chatId, photos) {
     console.error('handlePhoto error:', (e && e.message) || e);
     try { await sendMessage(token, chatId, "Hit an error saving that photo — send it again."); } catch { /* ignore */ }
   } finally {
+    if (lockTaken) await sbReleaseLock(chatId);
     stop();
     commitTiming(_tm);
   }
@@ -640,6 +701,29 @@ export default async function handler(req, res) {
       return res.status(200).json({ selftest: 'supabase', ok, roundtrip: !!row });
     } catch (e) {
       return res.status(200).json({ selftest: 'supabase', ok: false, error: String((e && e.message) || e) });
+    }
+  }
+  // Concurrency proof for the per-chat TURN LOCK: fire N concurrent atomic acquires against a
+  // sentinel row; exactly ONE must win (this is what closes the agent-deciding window). Then prove
+  // a held lock rejects further acquires, and a released lock can be re-taken.
+  if (req.method === 'GET' && req.query && req.query.selftest === 'lockrace') {
+    if (!sbConfigured()) return res.status(200).json({ selftest: 'lockrace', ok: false, reason: 'supabase not set' });
+    const sentinel = 999000222;
+    const N = Math.min(Math.max(Number(req.query.n) || 6, 2), 20);
+    try {
+      await sbUpsert(sentinel, 'lockrace', 'lockrace');   // ensure the row exists
+      await sbReleaseLock(sentinel);                      // start with the lock free
+      const winners = (await Promise.all(Array.from({ length: N }, () => sbAcquireLock(sentinel)))).filter(Boolean).length;
+      const wave2 = (await Promise.all(Array.from({ length: 3 }, () => sbAcquireLock(sentinel)))).filter(Boolean).length; // lock held -> expect 0
+      await sbReleaseLock(sentinel);
+      const afterRelease = (await sbAcquireLock(sentinel)) ? 1 : 0;                                 // expect 1
+      await sbReleaseLock(sentinel);
+      await sbDelete(sentinel);
+      return res.status(200).json({ selftest: 'lockrace', n: N, winners, wave2_winners: wave2, after_release_winner: afterRelease,
+        ok: winners === 1 && wave2 === 0 && afterRelease === 1 });
+    } catch (e) {
+      try { await sbDelete(sentinel); } catch { /* ignore */ }
+      return res.status(200).json({ selftest: 'lockrace', ok: false, error: String((e && e.message) || e) });
     }
   }
   // Diagnostic: latency breakdown of the most recent turn (ms from background start).
@@ -759,10 +843,12 @@ export default async function handler(req, res) {
       let row = await sbGet(chatId);
       mark(_tm, 'sbGet');
 
-      // DOUBLE-GENERATION GUARD: if a PDF is already being built for this chat, don't start
-      // a second generation (or even a second agent turn) — give real status.
-      if (isGeneratingActive(row)) {
-        await sendMessage(token, chatId, 'Still building your BPO — about 30 seconds…');
+      // TURN-LOCK GUARD (cheap, from the row already read): a turn is in flight for this chat —
+      // either the agent is DECIDING (the window the old guard missed) or a PDF is BUILDING. Don't
+      // start a second turn; give the busy response. (The atomic acquire below covers the race
+      // where a concurrent message read the row before the lock was set.)
+      if (lockHeld(row)) {
+        await sendMessage(token, chatId, BUSY_MSG);
         return;
       }
 
@@ -780,6 +866,16 @@ export default async function handler(req, res) {
         return;
       }
 
+      // TURN LOCK (atomic): everything below can run an agent turn and/or a generation. Take the
+      // per-chat lock so a concurrent message that slipped past the cheap guard (stale read) can't
+      // start a second turn. A brand-new chat has no row yet -> nothing to collide with; it skips
+      // the DB lock here and locks itself once its session row exists (in the fresh-start branch).
+      let lockTaken = false;
+      if (row) {
+        if (!(await sbAcquireLock(chatId))) { await sendMessage(token, chatId, BUSY_MSG); return; }
+        lockTaken = true;
+      }
+      try {
       // RETRY after a failed generation: re-run the stashed payload directly (no agent round
       // trip, no reliance on the agent re-emitting). Any other message clears the failed state
       // and routes to the agent normally (so the broker can also correct data instead).
@@ -813,6 +909,7 @@ export default async function handler(req, res) {
           sessionId = s.id;
           await sbUpsert(chatId, sessionId, s.envId);
           await sbClearState(chatId);       // drop any prior delivered/generating/failed state
+          if (!lockTaken) { await sbAcquireLock(chatId); lockTaken = true; } // lock this fresh turn (row now exists)
         } else {                            // REUSE: same stateful session = memory
           sessionId = row.session_id;
         }
@@ -852,6 +949,9 @@ export default async function handler(req, res) {
         await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
       } finally {
         stopTyping();
+      }
+      } finally {
+        if (lockTaken) await sbReleaseLock(chatId); // release the per-chat turn lock (success, conversational, or error)
       }
     } catch (e) {
       try { await sendMessage(token, chatId, '⚠️ Something went wrong — please try again.'); } catch { /* ignore */ }
