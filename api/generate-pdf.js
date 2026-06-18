@@ -11,7 +11,7 @@
 // is the sole authority on every derived value and all HTML assembly.)
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-11-photo1';
+const VERSION = '2026-06-17-headshot';
 
 // ---- Per-broker registry (identity + branding + template) -------------------
 const BROKERS = {
@@ -20,6 +20,9 @@ const BROKERS = {
     phone: '406.542.1811',
     email: 'jessie@jessieeagen.com',
     template_url: 'https://raw.githubusercontent.com/JoeKal97/brokeros-config/main/brokeros-template.html',
+    // Bio-page headshot (pilot: hardcoded public URL in the brokeros-photos bucket). Empty -> the
+    // grey avatar placeholder renders, unchanged. Per-broker branding record comes with onboarding.
+    headshot_url: '',
     branding: {
       primary_color: '#E8702A',
       secondary_color: '#000000',
@@ -179,6 +182,11 @@ const SLOT_PLACEHOLDERS = {
   divider: '<div class="divider-photo-placeholder">Property Photo</div>',
   comps: '<div class="comp-photo-ph">Subject Photo</div>',
 };
+// Bio-page headshot placeholder — identical to the template's original grey avatar so a broker
+// with no headshot_url renders exactly as before.
+const HEADSHOT_PLACEHOLDER =
+  '<div style="width:100%;height:100%;background:linear-gradient(135deg,#555,#333);display:flex;align-items:center;justify-content:center;">' +
+  '<svg width="40" height="40" viewBox="0 0 24 24" fill="rgba(255,255,255,0.2)"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/></svg></div>';
 function slotPhoto(url, placeholder) {
   return (url && /^https?:\/\//i.test(String(url)))
     ? '<img src="' + esc(url) + '" alt="Subject property" style="width:100%;height:100%;object-fit:cover;display:block;" />'
@@ -226,6 +234,7 @@ function buildVars(payload, broker) {
   const vars = {
     PROPERTY_ADDRESS_LINE1: esc(s.address_line1), CITY_STATE_ZIP: esc(s.city_state_zip),
     BROKER_NAME: esc(broker.name), BROKER_PHONE: esc(broker.phone), BROKER_EMAIL: esc(broker.email),
+    BROKER_HEADSHOT: slotPhoto(broker.headshot_url, HEADSHOT_PLACEHOLDER),
     CLIENT_NAME: esc(s.client_name), FULL_ADDRESS: full_address, MARKET_NAME: esc(s.market_name),
     ASSET_TYPE: esc(s.asset_type), BUILDING_SF: sfNum(building_sf),
     ACREAGE: isNum(acreage) ? acreage.toFixed(2) : DASH, TOUR_DATE: dateFmt(s.tour_date || new Date().toISOString()),
