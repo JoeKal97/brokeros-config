@@ -14,7 +14,7 @@
 export const config = { maxDuration: 60 };
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-17-maps2';
+const VERSION = '2026-06-17-badges';
 
 // ---- Per-broker registry (identity + branding + template) -------------------
 const BROKERS = {
@@ -44,6 +44,7 @@ const PAGINATION_CSS =
   '.page{margin:0 auto;break-after:page;page-break-after:always;break-inside:avoid;page-break-inside:avoid;}' +
   '.page:last-child{break-after:auto;page-break-after:auto;}' +
   '.page-label{display:none !important;}' +  // dev-only "Page N — Section" markers must never print on a client doc
+  '.exec-photo-num,.section-num{display:none !important;}' +  // option B: no page/section numbers anywhere, incl. decorative in-image badges ("06", "Section N")
   '</style>';
 
 // ---- Formatting + math helpers (endpoint is the authority) ------------------
