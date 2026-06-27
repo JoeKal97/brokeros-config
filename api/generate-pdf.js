@@ -14,7 +14,7 @@
 export const config = { maxDuration: 60 };
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-17-hide-devlabels';
+const VERSION = '2026-06-17-maps2';
 
 // ---- Per-broker registry (identity + branding + template) -------------------
 const BROKERS = {
@@ -272,6 +272,7 @@ function buildVars(payload, broker, maps = {}) {
     REGIONAL_MAP: maps.regional ? mapImg(maps.regional) : ('Map ' + DASH + ' ' + full_address),
     COMPS_MAP: maps.compsMap ? mapImg(maps.compsMap) : COMPS_MAP_FALLBACK,
     SUBJECT_MINI_MAP: maps.subjectMini ? '<img src="' + maps.subjectMini + '" alt="map" />' : '',
+    RING_MAP: maps.ringMap ? mapImg(maps.ringMap) : BULLSEYE_FALLBACK,
     DEMOGRAPHICS_ROWS: demo ? demo.demographics_rows : DEMO_FALLBACK,
     POPULATION_ROWS: demo ? demo.population_rows : POP_FALLBACK,
     HOUSEHOLD_ROWS: demo ? demo.household_rows : HH_FALLBACK,
@@ -397,6 +398,29 @@ async function staticMap(params, key) {
   } catch { return null; }
 }
 const mk = (color, label, loc) => `markers=${encodeURIComponent('color:' + color + (label ? '|label:' + label : '') + '|' + loc)}`;
+const parseLoc = (s) => { const a = String(s || '').split(',').map(Number); return (a.length === 2 && a.every(Number.isFinite)) ? a : null; };
+// Padded bounding-box `visible=` so Static Maps frames EVERY point with margin (markers alone fit
+// tight and clip edge pins). points = ["lat,lng", ...].
+function fitVisible(points, padFrac = 0.18) {
+  const pts = points.map(parseLoc).filter(Boolean);
+  if (!pts.length) return null;
+  let minLa = Infinity, maxLa = -Infinity, minLn = Infinity, maxLn = -Infinity;
+  for (const [la, ln] of pts) { minLa = Math.min(minLa, la); maxLa = Math.max(maxLa, la); minLn = Math.min(minLn, ln); maxLn = Math.max(maxLn, ln); }
+  const pLa = ((maxLa - minLa) || 0.01) * padFrac, pLn = ((maxLn - minLn) || 0.01) * padFrac;
+  const sw = `${(minLa - pLa).toFixed(6)},${(minLn - pLn).toFixed(6)}`, ne = `${(maxLa + pLa).toFixed(6)},${(maxLn + pLn).toFixed(6)}`;
+  return `visible=${encodeURIComponent(sw + '|' + ne)}`;
+}
+// A geographic circle as a closed many-point polygon `path` (Static Maps has no circle primitive).
+// fill = 0xRRGGBBAA (translucent). radiusMi around (lat,lng). ~1deg lat = 69mi; lng scaled by cos(lat).
+function circlePath(lat, lng, radiusMi, fill) {
+  const N = 44, pts = [];
+  const dLatBase = radiusMi / 69, dLngBase = radiusMi / (69 * Math.cos(lat * Math.PI / 180));
+  for (let i = 0; i <= N; i++) {
+    const a = 2 * Math.PI * i / N;
+    pts.push((lat + dLatBase * Math.cos(a)).toFixed(5) + ',' + (lng + dLngBase * Math.sin(a)).toFixed(5));
+  }
+  return `path=${encodeURIComponent(`fillcolor:${fill}|color:0xE8702A66|weight:1|` + pts.join('|'))}`;
+}
 
 // Geocode the subject + comps once, then build the regional map, the all-comps map, and per-comp
 // thumbnails in parallel. Returns { regional, compsMap, compMaps[] } as data-URIs (or null each).
@@ -406,21 +430,44 @@ async function buildMaps(payload, key) {
   const s = payload.subject || {};
   const comps = Array.isArray(payload.comps) ? payload.comps.slice(0, 6) : [];
   const subjAddr = [s.address_line1, s.city_state_zip].filter(Boolean).join(', ');
+  // Comp geocode: if a comp has no city of its own, fall back to the subject's city/state (comps are
+  // in the same market) so a street-only comp still geocodes and gets a marker.
   const [subjLoc, ...compLocs] = await Promise.all([
     geocode(subjAddr, key),
-    ...comps.map((c) => geocode([c.address, c.city_state].filter(Boolean).join(', '), key)),
+    ...comps.map((c) => geocode([c.address, c.city_state || s.city_state_zip].filter(Boolean).join(', '), key)),
   ]);
+  const validCompLocs = compLocs.filter(Boolean);
 
   const regionalP = subjLoc
     ? staticMap([`center=${encodeURIComponent(subjLoc)}`, 'zoom=13', 'size=640x400', 'scale=2', mk(MAP_ORANGE, '', subjLoc)], key)
     : Promise.resolve(null);
 
+  // Sale Comps Map: subject (S) + every comp (numbered) framed by a PADDED bounding box that
+  // includes all of them (explicit visible= so no pin is clipped at the edge).
   const compMarkers = [];
   if (subjLoc) compMarkers.push(mk('red', 'S', subjLoc));
   compLocs.forEach((loc, i) => { if (loc) compMarkers.push(mk(MAP_ORANGE, String(i + 1), loc)); });
+  const fit = fitVisible([subjLoc, ...validCompLocs].filter(Boolean));
   const compsMapP = compMarkers.length
-    ? staticMap(['size=640x400', 'scale=2', ...compMarkers], key)  // no center/zoom -> auto-fit to markers
+    ? staticMap(['size=640x400', 'scale=2', ...(fit ? [fit] : []), ...compMarkers], key)
     : Promise.resolve(null);
+
+  // Demographics RING map: real street map of the subject area with 1/3/5-mile rings overlaid as
+  // translucent circle polygons; framed to the 5-mile ring. Largest ring first so smaller draw on top.
+  let ringMapP = Promise.resolve(null);
+  const sloc = parseLoc(subjLoc);
+  if (sloc) {
+    const [la, ln] = sloc;
+    const ringVisible = fitVisible([
+      `${la + 5 / 69},${ln}`, `${la - 5 / 69},${ln}`,
+      `${la},${ln + 5 / (69 * Math.cos(la * Math.PI / 180))}`, `${la},${ln - 5 / (69 * Math.cos(la * Math.PI / 180))}`,
+    ], 0.06);
+    ringMapP = staticMap([
+      'size=600x520', 'scale=2', ...(ringVisible ? [ringVisible] : []),
+      circlePath(la, ln, 5, '0xE8702A14'), circlePath(la, ln, 3, '0xE8702A1F'), circlePath(la, ln, 1, '0xE8702A33'),
+      mk(MAP_ORANGE, '', subjLoc),
+    ], key);
+  }
 
   // subject thumbnail for the comps-page subject row (same size as the comp thumbnails)
   const subjectMiniP = subjLoc
@@ -431,11 +478,19 @@ async function buildMaps(payload, key) {
     ? staticMap([`center=${encodeURIComponent(loc)}`, 'zoom=15', 'size=200x130', 'scale=2', mk(MAP_ORANGE, '', loc)], key)
     : Promise.resolve(null));
 
-  const [regional, compsMap, subjectMini, ...compMaps] = await Promise.all([regionalP, compsMapP, subjectMiniP, ...compMapsP]);
-  return { regional, compsMap, subjectMini, compMaps };
+  const [regional, compsMap, ringMap, subjectMini, ...compMaps] = await Promise.all([regionalP, compsMapP, ringMapP, subjectMiniP, ...compMapsP]);
+  return { regional, compsMap, ringMap, subjectMini, compMaps };
 }
 const mapImg = (uri) => '<img src="' + uri + '" alt="Map" style="width:100%;height:100%;object-fit:cover;display:block;" />';
 const COMPS_MAP_FALLBACK = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(0,0,0,0.15);font-family:\'Barlow Condensed\',sans-serif;font-size:13px;letter-spacing:0.1em;text-transform:uppercase;">Comps Map</div>';
+// Ring-map fallback = the original decorative bullseye, so a no-key/failed render looks unchanged.
+const BULLSEYE_FALLBACK =
+  '<div class="analytics-map-placeholder"><div style="width:340px;height:340px;position:relative;display:flex;align-items:center;justify-content:center;">' +
+  '<div style="width:340px;height:340px;border-radius:50%;background:rgba(212,89,10,0.12);position:absolute;"></div>' +
+  '<div style="width:220px;height:220px;border-radius:50%;background:rgba(212,89,10,0.18);position:absolute;"></div>' +
+  '<div style="width:110px;height:110px;border-radius:50%;background:rgba(212,89,10,0.28);position:absolute;"></div>' +
+  '<div style="width:10px;height:10px;border-radius:50%;background:var(--orange);position:absolute;"></div>' +
+  '</div></div>';
 
 export default async function handler(req, res) {
   // Deploy marker: GET (or ?version) returns the running version.
