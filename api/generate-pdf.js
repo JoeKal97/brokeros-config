@@ -14,7 +14,7 @@
 export const config = { maxDuration: 60 };
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-17-demographics';
+const VERSION = '2026-06-17-numbering-minimap';
 
 // ---- Per-broker registry (identity + branding + template) -------------------
 const BROKERS = {
@@ -270,6 +270,7 @@ function buildVars(payload, broker, maps = {}) {
     COMPS_SUBJECT_PHOTO: slotPhoto(sp.comps, SLOT_PLACEHOLDERS.comps),
     REGIONAL_MAP: maps.regional ? mapImg(maps.regional) : ('Map ' + DASH + ' ' + full_address),
     COMPS_MAP: maps.compsMap ? mapImg(maps.compsMap) : COMPS_MAP_FALLBACK,
+    SUBJECT_MINI_MAP: maps.subjectMini ? '<img src="' + maps.subjectMini + '" alt="map" />' : '',
     DEMOGRAPHICS_ROWS: demo ? demo.demographics_rows : DEMO_FALLBACK,
     POPULATION_ROWS: demo ? demo.population_rows : POP_FALLBACK,
     HOUSEHOLD_ROWS: demo ? demo.household_rows : HH_FALLBACK,
@@ -420,12 +421,17 @@ async function buildMaps(payload, key) {
     ? staticMap(['size=640x400', 'scale=2', ...compMarkers], key)  // no center/zoom -> auto-fit to markers
     : Promise.resolve(null);
 
+  // subject thumbnail for the comps-page subject row (same size as the comp thumbnails)
+  const subjectMiniP = subjLoc
+    ? staticMap([`center=${encodeURIComponent(subjLoc)}`, 'zoom=15', 'size=200x130', 'scale=2', mk(MAP_ORANGE, '', subjLoc)], key)
+    : Promise.resolve(null);
+
   const compMapsP = compLocs.map((loc) => loc
     ? staticMap([`center=${encodeURIComponent(loc)}`, 'zoom=15', 'size=200x130', 'scale=2', mk(MAP_ORANGE, '', loc)], key)
     : Promise.resolve(null));
 
-  const [regional, compsMap, ...compMaps] = await Promise.all([regionalP, compsMapP, ...compMapsP]);
-  return { regional, compsMap, compMaps };
+  const [regional, compsMap, subjectMini, ...compMaps] = await Promise.all([regionalP, compsMapP, subjectMiniP, ...compMapsP]);
+  return { regional, compsMap, subjectMini, compMaps };
 }
 const mapImg = (uri) => '<img src="' + uri + '" alt="Map" style="width:100%;height:100%;object-fit:cover;display:block;" />';
 const COMPS_MAP_FALLBACK = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(0,0,0,0.15);font-family:\'Barlow Condensed\',sans-serif;font-size:13px;letter-spacing:0.1em;text-transform:uppercase;">Comps Map</div>';
