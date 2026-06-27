@@ -10,8 +10,11 @@
 // Contract: docs/BPO-PAYLOAD-SCHEMA.md  (OC sends raw data + prose only; the endpoint
 // is the sole authority on every derived value and all HTML assembly.)
 
+// Maps (geocode + static-map fetches) add a few seconds before the PDFShift render.
+export const config = { maxDuration: 60 };
+
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-17-pagesuppress';
+const VERSION = '2026-06-17-maps';
 
 // ---- Per-broker registry (identity + branding + template) -------------------
 const BROKERS = {
@@ -123,8 +126,9 @@ function statusBadge(status) {
   return map[String(status || '').toLowerCase()] || ['sold', 'Sale Comp'];
 }
 
-function compBlock(c, idx) {
+function compBlock(c, idx, mapUri) {
   const [cls, label] = statusBadge(c.status);
+  const miniMap = mapUri ? '<img src="' + mapUri + '" alt="map" />' : '';
   const photo = c.photo_url
     ? '<div class="comp-photo"><img src="' + esc(c.photo_url) + '" alt="comp" /></div>'
     : '<div class="comp-photo"><div class="comp-photo-ph">Comp Photo</div></div>';
@@ -143,14 +147,14 @@ function compBlock(c, idx) {
     '<div class="comp-spec-item">No. Units: <span>' + intf(num(c.units)) + '</span></div>' +
     '<div class="comp-spec-item">Cap Rate: <span>' + pct(num(c.cap_rate), 2) + '</span></div>' +
     '<div class="comp-spec-item">Year Built: <span>' + yearf(num(c.year_built)) + '</span></div>' +
-    '</div></div><div class="comp-mini-map"></div></div>'
+    '</div></div><div class="comp-mini-map">' + miniMap + '</div></div>'
   );
 }
 
-function buildComps(comps) {
+function buildComps(comps, compMaps = []) {
   const list = Array.isArray(comps) ? comps.slice(0, 6) : [];
   const out = {};
-  for (let i = 0; i < 6; i++) out['COMP_' + (i + 1) + '_ROW'] = list[i] ? compBlock(list[i], i + 1) : '';
+  for (let i = 0; i < 6; i++) out['COMP_' + (i + 1) + '_ROW'] = list[i] ? compBlock(list[i], i + 1, compMaps[i]) : '';
   let summary = '', sp = 0, sb = 0, sl = 0, np = 0, nb = 0, nl = 0;
   for (const c of list) {
     summary +=
@@ -215,7 +219,7 @@ function distributeSubjectPhotos(urls) {
 }
 
 // ---- Build the full {{VARIABLE}} map from the payload -----------------------
-function buildVars(payload, broker) {
+function buildVars(payload, broker, maps = {}) {
   const s = payload.subject || {};
   const nar = payload.narratives || {};
   const sp = distributeSubjectPhotos(subjectPhotoUrls(s)); // subject photos across the 9 slots
@@ -264,12 +268,14 @@ function buildVars(payload, broker) {
     DIVIDER_PHOTO_4: slotPhoto(sp.div[3], SLOT_PLACEHOLDERS.divider),
     DIVIDER_PHOTO_5: slotPhoto(sp.div[4], SLOT_PLACEHOLDERS.divider),
     COMPS_SUBJECT_PHOTO: slotPhoto(sp.comps, SLOT_PLACEHOLDERS.comps),
+    REGIONAL_MAP: maps.regional ? mapImg(maps.regional) : ('Map ' + DASH + ' ' + full_address),
+    COMPS_MAP: maps.compsMap ? mapImg(maps.compsMap) : COMPS_MAP_FALLBACK,
     DEMOGRAPHICS_ROWS: demo ? demo.demographics_rows : DEMO_FALLBACK,
     POPULATION_ROWS: demo ? demo.population_rows : POP_FALLBACK,
     HOUSEHOLD_ROWS: demo ? demo.household_rows : HH_FALLBACK
   };
   Object.assign(vars, buildRentRoll(payload.tenants, building_sf));
-  Object.assign(vars, buildComps(payload.comps));
+  Object.assign(vars, buildComps(payload.comps, maps.compMaps || []));
   return vars;
 }
 
@@ -322,6 +328,68 @@ function optionalPages(payload) {
   };
 }
 
+// ---- Google Maps (Geocoding + Static Maps) ---------------------------------
+// SECURITY: the API key is read from env and used ONLY in server-side fetches here. The fetched
+// map images are embedded as base64 data-URIs, so the key NEVER appears in the HTML/PDF output or
+// reaches PDFShift. Any geocode/fetch failure returns null and the slot keeps its placeholder.
+const GMAPS_GEOCODE = 'https://maps.googleapis.com/maps/api/geocode/json';
+const GMAPS_STATIC = 'https://maps.googleapis.com/maps/api/staticmap';
+const MAP_ORANGE = '0xE8702A';
+
+async function geocode(address, key) {
+  if (!address) return null;
+  try {
+    const r = await fetch(`${GMAPS_GEOCODE}?address=${encodeURIComponent(address)}&key=${key}`);
+    if (!r.ok) return null;
+    const j = await r.json();
+    const loc = j && j.status === 'OK' && j.results && j.results[0] && j.results[0].geometry && j.results[0].geometry.location;
+    return loc ? `${loc.lat},${loc.lng}` : null;
+  } catch { return null; }
+}
+async function staticMap(params, key) {
+  try {
+    const r = await fetch(`${GMAPS_STATIC}?${params.join('&')}&key=${key}`);
+    if (!r.ok) return null;
+    if (!(r.headers.get('content-type') || '').includes('image')) return null; // Google returns text on error
+    return 'data:image/png;base64,' + Buffer.from(await r.arrayBuffer()).toString('base64');
+  } catch { return null; }
+}
+const mk = (color, label, loc) => `markers=${encodeURIComponent('color:' + color + (label ? '|label:' + label : '') + '|' + loc)}`;
+
+// Geocode the subject + comps once, then build the regional map, the all-comps map, and per-comp
+// thumbnails in parallel. Returns { regional, compsMap, compMaps[] } as data-URIs (or null each).
+async function buildMaps(payload, key) {
+  const empty = { regional: null, compsMap: null, compMaps: [] };
+  if (!key) return empty;
+  const s = payload.subject || {};
+  const comps = Array.isArray(payload.comps) ? payload.comps.slice(0, 6) : [];
+  const subjAddr = [s.address_line1, s.city_state_zip].filter(Boolean).join(', ');
+  const [subjLoc, ...compLocs] = await Promise.all([
+    geocode(subjAddr, key),
+    ...comps.map((c) => geocode([c.address, c.city_state].filter(Boolean).join(', '), key)),
+  ]);
+
+  const regionalP = subjLoc
+    ? staticMap([`center=${encodeURIComponent(subjLoc)}`, 'zoom=13', 'size=640x400', 'scale=2', mk(MAP_ORANGE, '', subjLoc)], key)
+    : Promise.resolve(null);
+
+  const compMarkers = [];
+  if (subjLoc) compMarkers.push(mk('red', 'S', subjLoc));
+  compLocs.forEach((loc, i) => { if (loc) compMarkers.push(mk(MAP_ORANGE, String(i + 1), loc)); });
+  const compsMapP = compMarkers.length
+    ? staticMap(['size=640x400', 'scale=2', ...compMarkers], key)  // no center/zoom -> auto-fit to markers
+    : Promise.resolve(null);
+
+  const compMapsP = compLocs.map((loc) => loc
+    ? staticMap([`center=${encodeURIComponent(loc)}`, 'zoom=15', 'size=200x130', 'scale=2', mk(MAP_ORANGE, '', loc)], key)
+    : Promise.resolve(null));
+
+  const [regional, compsMap, ...compMaps] = await Promise.all([regionalP, compsMapP, ...compMapsP]);
+  return { regional, compsMap, compMaps };
+}
+const mapImg = (uri) => '<img src="' + uri + '" alt="Map" style="width:100%;height:100%;object-fit:cover;display:block;" />';
+const COMPS_MAP_FALLBACK = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(0,0,0,0.15);font-family:\'Barlow Condensed\',sans-serif;font-size:13px;letter-spacing:0.1em;text-transform:uppercase;">Comps Map</div>';
+
 export default async function handler(req, res) {
   // Deploy marker: GET (or ?version) returns the running version.
   if (req.method === 'GET' || req.query && req.query.version !== undefined) {
@@ -350,7 +418,8 @@ export default async function handler(req, res) {
       if (!tplResp.ok) return res.status(502).json({ error: 'Template fetch failed', detail: 'HTTP ' + tplResp.status });
       const tpl = await tplResp.text();
 
-      const vars = buildVars(payload, broker);
+      const maps = await buildMaps(payload, process.env.GOOGLE_MAPS_API_KEY); // server-side; null slots keep placeholders
+      const vars = buildVars(payload, broker, maps);
       source = fillTemplate(tpl, vars);
       source = applyOptionalPages(source, optionalPages(payload)); // drop unused pages (blank comp page 2, no-city demographics)
       filenameSeed = (payload.subject && payload.subject.address_line1) || 'bpo-document';
