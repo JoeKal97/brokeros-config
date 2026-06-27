@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-17-tg-19-voice';
+const VERSION = '2026-06-17-tg-20-batch';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -357,6 +357,60 @@ async function fileGateAcquire(token, chatId, instantAck) {
   return false;
 }
 
+// ---- BATCH SETTLE / DEBOUNCE (one consolidated confirmation per batch) ----
+// When a broker forwards N comps (or N photos) at once, each arrives as its own webhook. Without
+// debounce the agent emits a separate, growing confirmation after EVERY file ("comp 1?" → "comps 1-2?"
+// → "comps 1-2-3?"), which reads like files were lost. Instead each file APPENDS its parsed item to a
+// per-chat buffer (cross-instance, in Supabase) under the turn lock (so appends can't clobber), then
+// the LAST file to land (none newer for BATCH_SETTLE_MS) drains the buffer and emits ONE consolidated
+// confirmation. Buffer = `pending_batch jsonb`, shaped { comp:{items,token}, photo:{items,token} } so
+// the two kinds never clobber each other. Each append stamps a fresh token; the settler is whoever's
+// token is still latest after the wait. REQUIRES `pending_batch jsonb` (ALTER TABLE) — if absent, the
+// write 400s and we fall back to the previous per-file inject+confirm (so it's safe to ship pre-migration).
+const BATCH_SETTLE_MS = 2500;
+// PATCH the buffer; returns true on success, false if the column doesn't exist (-> fallback path).
+async function sbWriteBatch(chatId, pendingBatch) {
+  let r;
+  try {
+    r = await fetch(`${SB_URL}/rest/v1/telegram_sessions?telegram_chat_id=eq.${chatId}`, {
+      method: 'PATCH', headers: { ...sbHeaders(), Prefer: 'return=minimal' },
+      body: JSON.stringify({ pending_batch: pendingBatch }),
+    });
+  } catch { return false; }
+  return r.ok;
+}
+// Append one parsed item to the buffer for `kind`. Caller MUST hold the turn lock (serializes the
+// read-modify-write). Returns { myToken } on success or { fallback:true } if the column is missing.
+async function batchAppend(chatId, kind, item) {
+  const myToken = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const row = await sbGet(chatId);
+  const pb = (row && row.pending_batch && typeof row.pending_batch === 'object') ? row.pending_batch : {};
+  const cur = (pb[kind] && Array.isArray(pb[kind].items)) ? pb[kind] : { items: [] };
+  cur.items.push(item);
+  cur.token = myToken;
+  pb[kind] = cur;
+  return (await sbWriteBatch(chatId, pb)) ? { myToken } : { fallback: true };
+}
+// Wait the settle window, then claim the batch IFF no newer file landed (our token still latest).
+// Returns the drained items array if THIS call is the settler, else null (a later file will settle).
+async function batchSettle(chatId, kind, myToken) {
+  await sleep(BATCH_SETTLE_MS);
+  const row = await sbGet(chatId);
+  const pb = (row && row.pending_batch && typeof row.pending_batch === 'object') ? row.pending_batch : null;
+  if (!pb || !pb[kind] || pb[kind].token !== myToken) return null; // superseded -> a later file settles
+  const items = Array.isArray(pb[kind].items) ? pb[kind].items : [];
+  delete pb[kind];
+  await sbWriteBatch(chatId, Object.keys(pb).length ? pb : null); // clear our slice; keep the other kind
+  return items;
+}
+// Re-take the turn lock for the settler's single consolidated turn (no ack; the file acks already fired).
+async function lockWait(chatId, maxMs = FILE_QUEUE_WAIT_MS) {
+  if (await sbAcquireLock(chatId)) return true;
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) { await sleep(2000); if (await sbAcquireLock(chatId)) return true; }
+  return false;
+}
+
 // Answer a STATUS check-in with the real state — never a generic ack. (Mid-generation is
 // caught earlier by the guard; this covers failed / active-idle / no-session.)
 async function answerStatus(token, chatId, row) {
@@ -552,10 +606,35 @@ async function parseCompPdf(bytes) {
   return { ok: false, detail: (j && (j.detail || j.error)) || ('HTTP ' + r.status) };
 }
 
+// Inject one OR a whole batch of parsed comps in a SINGLE agent turn -> ONE COMP CONFIRMATION block.
+// Caller holds the turn lock. Used both for the settled batch (N comps) and the no-column fallback (1).
+async function injectCompsAndReply(token, chatId, comps) {
+  let row = await sbGet(chatId);
+  let sessionId;
+  if (!row || !row.session_id) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
+  else sessionId = row.session_id;
+  const n = comps.length, many = n > 1;
+  const injection =
+    `[The broker uploaded ${n} MLS Matrix comp PDF${many ? 's together (a batch)' : ''}. The system has already parsed ${many ? 'them' : 'it'} — do NOT ask them to type anything. ADD ${many ? 'these comps' : 'this comp'} to any comps you already have for this BPO (accumulate). Each comp photo is uploaded; use its photo_url EXACTLY as given. Then run the COMP CONFIRMATION step ONCE: show ALL comps captured so far in the comp-confirmation block format and ask the broker to confirm before you use them. Do NOT modify, recompute, or invent any field — OCR can slip a digit, which is exactly why the broker confirms.]\n` +
+    `Parsed comp${many ? 's' : ''} (JSON${many ? ' array' : ''}):\n${JSON.stringify(many ? comps : comps[0])}`;
+  const deadline = Date.now() + 200000;
+  let reply;
+  try { reply = await sendTurn(sessionId, injection, deadline); }
+  catch (e) {
+    const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId);
+    reply = await sendTurn(sessionId, injection, deadline);
+  }
+  if (!reply) { await sendMessage(token, chatId, `Read the comp${many ? 's' : ''}, but couldn’t get the confirmation back in time. Send ${many ? 'them' : 'it'} again.`); return; }
+  const payload = extractGenerate(reply);
+  if (payload) { await runGeneration(token, chatId, payload); return; }
+  await sbTouch(chatId);
+  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
+}
+
 // A comp PDF arrived: download -> parse-comp-pdf -> upload the extracted photo to Supabase ->
-// inject the parsed comp (+ photo_url) into the session. Agent accumulates comps and runs the
-// A6-style COMP CONFIRMATION before any generation. Bridge does ALL file work; agent only
-// places the confirmed comp data + photo_url into the payload (same pattern as xlsx/subject photo).
+// append it to the batch buffer. Agent accumulates comps and runs the A6-style COMP CONFIRMATION
+// (ONCE per batch) before any generation. Bridge does ALL file work; agent only places the confirmed
+// comp data + photo_url into the payload (same pattern as xlsx/subject photo).
 async function handleCompPdf(token, chatId, doc) {
   const stop = startTyping(token, chatId);
   let lockTaken = false;
@@ -587,29 +666,16 @@ async function handleCompPdf(token, chatId, doc) {
     const comp = { ...parsed.comp, photo_url };
     recordUpload(chatId, { name: doc.file_name || 'that comp PDF', kind: 'comp_pdf', supported: true, readable: 'MLS comp PDF' });
 
-    // Resolve/continue the chat's BPO session (accumulate comps across multiple PDFs).
-    let row = await sbGet(chatId);
-    let sessionId;
-    if (!row) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
-    else sessionId = row.session_id;
-
-    const injection =
-      `[The broker uploaded an MLS Matrix comp PDF "${doc.file_name || 'comp.pdf'}". The system has already parsed it for you — do NOT ask them to type it. ADD this comp to any comps you already have for this BPO (the broker may forward several; accumulate them). The comp photo is uploaded; use photo_url EXACTLY as given. Then run the COMP CONFIRMATION step: show ALL comps captured so far in the comp-confirmation block format and ask the broker to confirm before you use them. Do NOT modify, recompute, or invent any field — OCR can slip a digit, which is exactly why the broker confirms.]\n` +
-      `Parsed comp (JSON):\n${JSON.stringify(comp)}`;
-
-    const deadline = Date.now() + 200000;
-    let reply;
-    try { reply = await sendTurn(sessionId, injection, deadline); }
-    catch (e) {
-      const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId);
-      reply = await sendTurn(sessionId, injection, deadline);
-    }
-    if (!reply) { await sendMessage(token, chatId, `Read the comp from ${doc.file_name || 'your PDF'}, but couldn’t get the confirmation back in time. Send it again.`); return; }
-
-    const payload = extractGenerate(reply);
-    if (payload) { await runGeneration(token, chatId, payload); return; }
-    await sbTouch(chatId);
-    await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
+    // Debounce a BATCH of comps into ONE confirmation: append under the held lock (atomic), release so
+    // the rest of the batch can land, then only the settler (no newer comp for BATCH_SETTLE_MS) emits.
+    const appended = await batchAppend(chatId, 'comp', comp);
+    if (appended.fallback) { await injectCompsAndReply(token, chatId, [comp]); return; } // no column -> per-file
+    await sbReleaseLock(chatId); lockTaken = false;          // let the rest of the batch append
+    const items = await batchSettle(chatId, 'comp', appended.myToken);
+    if (!items) return;                                       // a later comp will emit the consolidated confirmation
+    if (!(await lockWait(chatId))) return;                    // re-take the lock for the single consolidated turn
+    lockTaken = true;
+    await injectCompsAndReply(token, chatId, items);
   } catch (e) {
     console.error('handleCompPdf error:', (e && e.message) || e);
     try { await sendMessage(token, chatId, `Got ${doc.file_name || 'your PDF'}, but hit an error reading it. You can type the comp details instead.`); } catch { /* ignore */ }
@@ -723,15 +789,42 @@ async function uploadPhoto(bytes, key, ext) {
   return `${SB_URL}/storage/v1/object/public/${PHOTO_BUCKET}/${key}`;
 }
 
-// A PHOTO arrived: grab bytes (tg-7), store in the bucket, inject the public URL into the
-// agent session as the SUBJECT photo. Bridge does all file work; agent only places the URL.
+// Inject one OR a whole batch of subject-photo URLs in a SINGLE turn, and send ONE "got your N photos"
+// (the bridge owns the count confirmation). Caller holds the turn lock. Used for the settled batch and
+// the no-column fallback (1).
+async function injectPhotosAndReply(token, chatId, urls) {
+  let row = await sbGet(chatId);
+  let sessionId;
+  if (!row || !row.session_id) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
+  else sessionId = row.session_id;
+  const n = urls.length, many = n > 1;
+  await sendMessage(token, chatId, many ? `Got your ${n} photos — I’ll place them across the BPO.` : 'Got the property photo.');
+  const injection =
+    `[The broker sent ${n} SUBJECT PROPERTY photo${many ? 's together (a batch)' : ''}. Public URL${many ? 's IN ORDER' : ''}:\n${urls.join('\n')}\n` +
+    `APPEND ${many ? 'all of these' : 'this URL'} to subject.photo_urls — an ORDERED array. KEEP any URLs already there and add ${many ? 'these' : 'this one'} to the end; never drop earlier photos. The FIRST photo ever received is the cover hero; the rest the server distributes across the BPO (exec summary, section dividers, comps subject row). Do not ask for the cover again. The broker was ALREADY told the count, so do NOT re-list or re-count the photos — acknowledge in at most one short line (or nothing) and continue the flow.]`;
+  const deadline = Date.now() + 200000;
+  let reply;
+  try { reply = await sendTurn(sessionId, injection, deadline); }
+  catch (e) {
+    const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId);
+    reply = await sendTurn(sessionId, injection, deadline);
+  }
+  if (!reply) return; // already sent the count confirmation
+  const payload = extractGenerate(reply);
+  if (payload) { await runGeneration(token, chatId, payload); return; }
+  await sbTouch(chatId);
+  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
+}
+
+// A PHOTO arrived: grab bytes (tg-7), store in the bucket, append it to the batch buffer; the settler
+// injects all URLs as SUBJECT photos. Bridge does all file work; agent only places the URLs.
 async function handlePhoto(token, chatId, photos) {
   const _tm = newTiming('photo', chatId);
   const stop = startTyping(token, chatId);
   let lockTaken = false;
   try {
     // Queue behind any in-flight turn (don't reject) so batched photos all process + distribute.
-    lockTaken = await fileGateAcquire(token, chatId, 'Got it — saving that photo…');
+    lockTaken = await fileGateAcquire(token, chatId, 'Got it — saving your photo…');
     if (!lockTaken) return;
     mark(_tm, 'ackSent');
 
@@ -751,29 +844,19 @@ async function handlePhoto(token, chatId, photos) {
       return;
     }
     recordUpload(chatId, { name: 'the property photo', kind: 'photo', supported: true, readable: 'images' });
-    await sendMessage(token, chatId, 'Got the property photo.'); // bridge owns the confirmation
     mark(_tm, 'photoConfirm');
 
-    // Inject the URL into the chat's session so the agent puts it in subject.photo_url.
-    let row = await sbGet(chatId);
-    let sessionId;
-    if (!row) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
-    else sessionId = row.session_id;
-
-    const injection = `[The broker uploaded a SUBJECT PROPERTY photo. Its public URL is: ${url}\nAPPEND this URL to subject.photo_urls in the payload — an ORDERED array of subject photo URLs. The FIRST photo received is the cover hero; later ones are additional property shots the server distributes across the BPO (exec summary, section dividers, comps subject row). KEEP any URLs already in subject.photo_urls and add this one to the end. Never drop earlier photos. Do not ask for the cover photo again. Then continue the flow.]`;
-    const deadline = Date.now() + 200000;
-    let reply;
-    try { reply = await sendTurn(sessionId, injection, deadline); }
-    catch (e) {
-      const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId);
-      reply = await sendTurn(sessionId, injection, deadline);
-    }
+    // Debounce a BATCH of photos into ONE "got your N photos": append under the held lock, release so
+    // the rest of the batch lands, then only the settler injects all URLs + sends one count message.
+    const appended = await batchAppend(chatId, 'photo', url);
+    if (appended.fallback) { await injectPhotosAndReply(token, chatId, [url]); mark(_tm, 'agentReply'); return; } // no column -> per-file
+    await sbReleaseLock(chatId); lockTaken = false;          // let the rest of the batch append
+    const urls = await batchSettle(chatId, 'photo', appended.myToken);
+    if (!urls) return;                                       // a later photo will emit the consolidated ack
+    if (!(await lockWait(chatId))) return;                    // re-take the lock for the single consolidated turn
+    lockTaken = true;
+    await injectPhotosAndReply(token, chatId, urls);
     mark(_tm, 'agentReply');
-    if (!reply) return; // already confirmed "Got the property photo."
-    const payload = extractGenerate(reply);
-    if (payload) { await runGeneration(token, chatId, payload); return; }
-    await sbTouch(chatId);
-    await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
   } catch (e) {
     console.error('handlePhoto error:', (e && e.message) || e);
     try { await sendMessage(token, chatId, "Hit an error saving that photo — send it again."); } catch { /* ignore */ }
@@ -799,6 +882,29 @@ export default async function handler(req, res) {
       return res.status(200).json({ selftest: 'supabase', ok, roundtrip: !!row });
     } catch (e) {
       return res.status(200).json({ selftest: 'supabase', ok: false, error: String((e && e.message) || e) });
+    }
+  }
+  // Batch-debounce proof (confirms the `pending_batch` migration ran + the append/settle logic). Two
+  // appends, then settle: the stale token gets nothing, the latest token drains both items. If the
+  // column is missing, the first append reports fallback -> tells you the ALTER TABLE still needs running.
+  if (req.method === 'GET' && req.query && req.query.selftest === 'batch') {
+    if (!sbConfigured()) return res.status(200).json({ selftest: 'batch', ok: false, reason: 'supabase not set' });
+    const sentinel = 999000333;
+    try {
+      await sbUpsert(sentinel, 'selftest-session', 'selftest-env');
+      const a1 = await batchAppend(sentinel, 'comp', { tag: 'one' });
+      if (a1.fallback) { await sbDelete(sentinel); return res.status(200).json({ selftest: 'batch', ok: false, columnPresent: false, reason: 'pending_batch column missing — run: ALTER TABLE telegram_sessions ADD COLUMN IF NOT EXISTS pending_batch jsonb;' }); }
+      const a2 = await batchAppend(sentinel, 'comp', { tag: 'two' });
+      const mid = await sbGet(sentinel);
+      const buffered = mid && mid.pending_batch && mid.pending_batch.comp ? mid.pending_batch.comp.items.length : 0;
+      const stale = await batchSettle(sentinel, 'comp', a1.myToken); // superseded -> null
+      const drained = await batchSettle(sentinel, 'comp', a2.myToken); // settler -> [one, two]
+      await sbDelete(sentinel);
+      const ok = buffered === 2 && stale === null && Array.isArray(drained) && drained.length === 2;
+      return res.status(200).json({ selftest: 'batch', ok, columnPresent: true, buffered, staleGotNull: stale === null, drainedCount: Array.isArray(drained) ? drained.length : null });
+    } catch (e) {
+      try { await sbDelete(sentinel); } catch { /* ignore */ }
+      return res.status(200).json({ selftest: 'batch', ok: false, error: String((e && e.message) || e) });
     }
   }
   // Concurrency proof for the per-chat TURN LOCK: fire N concurrent atomic acquires against a
