@@ -11,7 +11,7 @@
 // is the sole authority on every derived value and all HTML assembly.)
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-17-headshot';
+const VERSION = '2026-06-17-pagesuppress';
 
 // ---- Per-broker registry (identity + branding + template) -------------------
 const BROKERS = {
@@ -219,6 +219,7 @@ function buildVars(payload, broker) {
   const s = payload.subject || {};
   const nar = payload.narratives || {};
   const sp = distributeSubjectPhotos(subjectPhotoUrls(s)); // subject photos across the 9 slots
+  const demo = cityDemographics(s); // static per-city demographics (null -> section suppressed)
   const building_sf = num(s.building_sf);
   const asking = num(s.asking_price);
   const list = isNum(num(s.list_price)) ? num(s.list_price) : asking;
@@ -263,9 +264,9 @@ function buildVars(payload, broker) {
     DIVIDER_PHOTO_4: slotPhoto(sp.div[3], SLOT_PLACEHOLDERS.divider),
     DIVIDER_PHOTO_5: slotPhoto(sp.div[4], SLOT_PLACEHOLDERS.divider),
     COMPS_SUBJECT_PHOTO: slotPhoto(sp.comps, SLOT_PLACEHOLDERS.comps),
-    DEMOGRAPHICS_ROWS: "<tr><td colspan='4'>Demographic data available upon request.</td></tr>",
-    POPULATION_ROWS: "<tr><td colspan='4'>Population data available upon request.</td></tr>",
-    HOUSEHOLD_ROWS: "<tr><td colspan='4'>Household &amp; income data available upon request.</td></tr>"
+    DEMOGRAPHICS_ROWS: demo ? demo.demographics_rows : DEMO_FALLBACK,
+    POPULATION_ROWS: demo ? demo.population_rows : POP_FALLBACK,
+    HOUSEHOLD_ROWS: demo ? demo.household_rows : HH_FALLBACK
   };
   Object.assign(vars, buildRentRoll(payload.tenants, building_sf));
   Object.assign(vars, buildComps(payload.comps));
@@ -279,6 +280,46 @@ function fillTemplate(tpl, vars) {
   }
   out = out.replace(/\{\{[A-Z0-9_]+\}\}/g, '');
   return out;
+}
+
+// ---- Per-city static demographics (no live feed) ---------------------------
+// Add a city = drop in an entry keyed by the normalized city name; the subject's city is matched
+// against this map. A city WITHOUT an entry SUPPRESSES the demographics section (pages 16-17)
+// instead of rendering an empty page. Each entry supplies the three table bodies as HTML <tr> rows
+// (Joe's static figures per city). Cities to come: Kalispell, Helena, Great Falls, Bozeman, Butte,
+// Billings. Missoula is pending Joe's figures — add it here and it renders automatically:
+//   missoula: {
+//     demographics_rows: '<tr><td>Total Population</td><td>{0.5mi}</td><td>{1mi}</td><td>{2.5mi}</td></tr>...',
+//     population_rows:   '<tr><td>...</td><td>{1mi}</td><td>{3mi}</td><td>{5mi}</td></tr>...',
+//     household_rows:    '<tr><td>...</td><td>{1mi}</td><td>{3mi}</td><td>{5mi}</td></tr>...',
+//   },
+const CITY_DEMOGRAPHICS = {
+};
+const DEMO_FALLBACK = "<tr><td colspan='4'>Demographic data available upon request.</td></tr>";
+const POP_FALLBACK = "<tr><td colspan='4'>Population data available upon request.</td></tr>";
+const HH_FALLBACK = "<tr><td colspan='4'>Household &amp; income data available upon request.</td></tr>";
+
+function cityKey(subject) {
+  return String((subject && subject.city_state_zip) || '').split(',')[0].trim().toLowerCase();
+}
+function cityDemographics(subject) {
+  return CITY_DEMOGRAPHICS[cityKey(subject)] || null;
+}
+
+// Optional-page suppression: any page wrapped in <!--OPT:name-->...<!--/OPT:name--> is kept only if
+// keep[name] !== false. Generalizes "render only if the data is present" — comp page 2 (>3 comps),
+// the demographics section (a city page exists). Run AFTER fillTemplate (markers are HTML comments,
+// untouched by var-filling). Unknown marker names default to KEEP (never silently drop a page).
+function applyOptionalPages(html, keep) {
+  return html.replace(/<!--OPT:([a-z0-9_]+)-->([\s\S]*?)<!--\/OPT:\1-->/gi,
+    (_m, name, body) => (keep[name] === false ? '' : body));
+}
+function optionalPages(payload) {
+  const comps = Array.isArray(payload.comps) ? payload.comps.slice(0, 6) : [];
+  return {
+    comps_page_2: comps.length > 3,                       // 2nd comp page only when comps 4-6 exist
+    demographics: !!cityDemographics(payload.subject || {}), // only when the city has a static page
+  };
 }
 
 export default async function handler(req, res) {
@@ -311,6 +352,7 @@ export default async function handler(req, res) {
 
       const vars = buildVars(payload, broker);
       source = fillTemplate(tpl, vars);
+      source = applyOptionalPages(source, optionalPages(payload)); // drop unused pages (blank comp page 2, no-city demographics)
       filenameSeed = (payload.subject && payload.subject.address_line1) || 'bpo-document';
       options = payload.options || {};
     } else if (body.html_content !== undefined) {
