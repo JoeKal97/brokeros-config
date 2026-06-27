@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-11-tg-18';
+const VERSION = '2026-06-17-tg-19-voice';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -619,6 +619,85 @@ async function handleCompPdf(token, chatId, doc) {
   }
 }
 
+// ---- VOICE memo: transcribe (Whisper) and feed the transcript to the agent as if typed --------
+// One-way: voice IN, text OUT. The brain stays text-only — it never sees audio, only the transcript.
+// Mis-transcriptions (esp. numbers) are caught by the agent's existing confirmation/reconciliation
+// steps, which the transcript flows through exactly like a typed message. Key from env, never logged.
+async function transcribe(bytes, filePath) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) { console.error('OPENAI_API_KEY not set'); return { ok: false, reason: 'no-key' }; }
+  // Telegram voice notes are OGG/Opus (file_path ends .oga); Whisper accepts oga/ogg/m4a/mp3/wav/webm.
+  const ext = (((filePath || '').match(/\.([A-Za-z0-9]+)$/) || [])[1] || 'oga').toLowerCase();
+  const fd = new FormData();
+  fd.append('file', new Blob([bytes]), `voice.${ext}`);
+  fd.append('model', 'whisper-1');
+  let r;
+  try {
+    r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST', headers: { Authorization: `Bearer ${key}` }, body: fd, // fetch sets multipart boundary
+    });
+  } catch (e) { console.error('whisper request error:', (e && e.message) || e); return { ok: false, reason: 'network' }; }
+  if (!r.ok) { console.error('whisper http', r.status, await r.text().catch(() => '')); return { ok: false, reason: 'http-' + r.status }; }
+  const j = await r.json().catch(() => null);
+  const text = j && typeof j.text === 'string' ? j.text.trim() : '';
+  return text ? { ok: true, text } : { ok: false, reason: 'empty' };
+}
+
+// A VOICE memo arrived: instant ack, grab the audio bytes (tg-7 getFile), transcribe via Whisper,
+// then run the transcript as a normal agent turn (the same session path a typed message takes).
+async function handleVoice(token, chatId, voice) {
+  const _tm = newTiming('voice', chatId);
+  const stop = startTyping(token, chatId);
+  let lockTaken = false;
+  try {
+    // Queue behind any in-flight turn (like file uploads); instant "listening…" ack BEFORE Whisper.
+    lockTaken = await fileGateAcquire(token, chatId, 'Got it — listening…');
+    if (!lockTaken) return;
+    const meta = voice && voice.file_id ? await tgGetFile(token, voice.file_id) : null;
+    const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
+    mark(_tm, 'downloaded');
+    if (!bytes) { await sendMessage(token, chatId, "Couldn’t grab that voice memo from Telegram — send it again or type it."); return; }
+
+    const tr = await transcribe(bytes, meta.file_path);
+    mark(_tm, 'transcribed');
+    if (!tr.ok || !tr.text) {
+      console.error('transcription failed:', tr.reason);
+      await sendMessage(token, chatId, "Couldn’t make out that voice memo — try again or type the details.");
+      return;
+    }
+    recordUpload(chatId, { name: 'your voice memo', kind: 'voice', supported: true, readable: 'voice notes' });
+
+    // Feed the transcript to the agent AS IF the broker typed it — same session continuation a text
+    // turn uses. Mis-transcriptions (esp. numbers) surface at the agent's confirmation step, not here.
+    let row = await sbGet(chatId);
+    let sessionId;
+    if (!row) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
+    else sessionId = row.session_id;
+
+    const deadline = Date.now() + 200000;
+    let reply;
+    try { reply = await sendTurn(sessionId, tr.text, deadline); }
+    catch (e) {
+      const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId);
+      reply = await sendTurn(sessionId, tr.text, deadline);
+    }
+    mark(_tm, 'agentReply');
+    if (!reply) { await sendMessage(token, chatId, "Got your voice memo but couldn’t get a reply in time — try again."); return; }
+
+    const payload = extractGenerate(reply);
+    if (payload) { await runGeneration(token, chatId, payload); return; }
+    await sbTouch(chatId);
+    await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
+  } catch (e) {
+    console.error('handleVoice error:', (e && e.message) || e);
+    try { await sendMessage(token, chatId, "Hit an error with that voice memo — try again or type it."); } catch { /* ignore */ }
+  } finally {
+    if (lockTaken) await sbReleaseLock(chatId);
+    stop();
+    commitTiming(_tm);
+  }
+}
+
 // Unsupported upload (non-xlsx doc, photo, voice, etc.): acknowledge it by name, say plainly
 // it can't be read yet, and give the broker the actionable fallback.
 async function handleUnsupportedFile(token, chatId, fileName, kind) {
@@ -769,6 +848,12 @@ export default async function handler(req, res) {
     }
     return res.status(200).json(out);
   }
+  // Confirm OPENAI_API_KEY is readable by the function (presence/length only, never the value) so a
+  // voice-in phone test won't silently fail on a missing/mis-named env var.
+  if (req.method === 'GET' && req.query && req.query.selftest === 'whisper') {
+    const k = process.env.OPENAI_API_KEY || '';
+    return res.status(200).json({ selftest: 'whisper', key_present: !!k, key_len: k.length });
+  }
   if (req.method === 'GET' || (req.query && req.query.version !== undefined)) {
     return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 3 });
   }
@@ -815,7 +900,19 @@ export default async function handler(req, res) {
     return;
   }
 
-  // Other non-text (voice/video/etc.): acknowledge by type with the actionable fallback.
+  // VOICE / AUDIO: transcribe (Whisper) server-side and feed the transcript to the agent as text.
+  // One-way (voice IN, text OUT). Queues + processes like any turn; never triggers a 2nd generation.
+  if (type === 'voice' || type === 'audio') {
+    res.status(200).json({ ok: true, version: VERSION, type, mode: 'voice' });
+    if (!sbConfigured()) {
+      waitUntil((async () => { try { await sendMessage(token, chatId, '⚙️ Session store not configured yet — add SUPABASE_URL and SUPABASE_SERVICE_KEY in Vercel and redeploy.'); } catch { /* ignore */ } })());
+      return;
+    }
+    waitUntil(handleVoice(token, chatId, msg.voice || msg.audio));
+    return;
+  }
+
+  // Other non-text (video/sticker/etc.): acknowledge by type with the actionable fallback.
   if (type !== 'text') {
     res.status(200).json({ ok: true, version: VERSION, type, mode: 'unsupported-file' });
     waitUntil(handleUnsupportedFile(token, chatId, null, type));
