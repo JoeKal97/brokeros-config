@@ -511,9 +511,10 @@ const BULLSEYE_FALLBACK =
   '</div></div>';
 
 export default async function handler(req, res) {
-  // Deploy marker: GET (or ?version) returns the running version.
+  // Deploy marker: GET (or ?version) returns the running version + which template source is live
+  // (bundle = read from the function bundle, no cache window; raw-fallback = bundled file unreadable).
   if (req.method === 'GET' || req.query && req.query.version !== undefined) {
-    return res.status(200).json({ version: VERSION });
+    return res.status(200).json({ version: VERSION, templateSource: loadLocalTemplate() ? 'bundle' : 'raw-fallback' });
   }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
