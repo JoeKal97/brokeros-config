@@ -14,7 +14,7 @@
 export const config = { maxDuration: 60 };
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-17-headshot-live';
+const VERSION = '2026-06-17-demographics';
 
 // ---- Per-broker registry (identity + branding + template) -------------------
 const BROKERS = {
@@ -272,7 +272,8 @@ function buildVars(payload, broker, maps = {}) {
     COMPS_MAP: maps.compsMap ? mapImg(maps.compsMap) : COMPS_MAP_FALLBACK,
     DEMOGRAPHICS_ROWS: demo ? demo.demographics_rows : DEMO_FALLBACK,
     POPULATION_ROWS: demo ? demo.population_rows : POP_FALLBACK,
-    HOUSEHOLD_ROWS: demo ? demo.household_rows : HH_FALLBACK
+    HOUSEHOLD_ROWS: demo ? demo.household_rows : HH_FALLBACK,
+    INCOME_ROWS: demo ? demo.income_rows : INCOME_FALLBACK
   };
   Object.assign(vars, buildRentRoll(payload.tenants, building_sf));
   Object.assign(vars, buildComps(payload.comps, maps.compMaps || []));
@@ -291,19 +292,58 @@ function fillTemplate(tpl, vars) {
 // ---- Per-city static demographics (no live feed) ---------------------------
 // Add a city = drop in an entry keyed by the normalized city name; the subject's city is matched
 // against this map. A city WITHOUT an entry SUPPRESSES the demographics section (pages 16-17)
-// instead of rendering an empty page. Each entry supplies the three table bodies as HTML <tr> rows
-// (Joe's static figures per city). Cities to come: Kalispell, Helena, Great Falls, Bozeman, Butte,
-// Billings. Missoula is pending Joe's figures — add it here and it renders automatically:
-//   missoula: {
-//     demographics_rows: '<tr><td>Total Population</td><td>{0.5mi}</td><td>{1mi}</td><td>{2.5mi}</td></tr>...',
-//     population_rows:   '<tr><td>...</td><td>{1mi}</td><td>{3mi}</td><td>{5mi}</td></tr>...',
-//     household_rows:    '<tr><td>...</td><td>{1mi}</td><td>{3mi}</td><td>{5mi}</td></tr>...',
-//   },
+// instead of rendering an empty page. All rings are 1/3/5-mile. Each entry supplies four row
+// bodies built with the helpers below:
+//   demographics_rows -> page 11 overview table (dRow: <tr>)
+//   population_rows / household_rows / income_rows -> page 17 sections (aRow: .analytics-row)
+// Cities to come: Kalispell, Helena, Great Falls, Bozeman, Butte, Billings.
+const dRow = (label, v1, v3, v5) => `<tr><td>${label}</td><td>${v1}</td><td>${v3}</td><td>${v5}</td></tr>`;
+const aRow = (label, v1, v3, v5) =>
+  `<div class="analytics-row"><span class="a-label">${label}</span><span class="a-cols"><span class="r">${v1}</span><span class="r">${v3}</span><span class="r">${v5}</span></span></div>`;
 const CITY_DEMOGRAPHICS = {
+  // Missoula — CoStar (ACS-derived), 1/3/5-mile rings centered on the 819 S Higgins corridor.
+  missoula: {
+    demographics_rows: [
+      dRow('2025 Population', '17,936', '69,118', '95,256'),
+      dRow('2025 Households', '8,309', '31,809', '42,211'),
+      dRow('Median Age', '32.6', '35.7', '37.1'),
+      dRow('Avg HH Income', '$81,453', '$84,573', '$91,511'),
+      dRow('Median HH Income', '$56,766', '$62,767', '$70,024'),
+      dRow("Bachelor's Degree+", '50%', '43%', '43%'),
+    ].join(''),
+    population_rows: [
+      aRow('2025 Population', '17,936', '69,118', '95,256'),
+      aRow('2030 Projection', '18,948', '71,959', '99,272'),
+      aRow("Growth '25–'30", '1.1%', '0.8%', '0.8%'),
+      aRow('Median Age', '32.6', '35.7', '37.1'),
+      aRow("Bachelor's Degree+", '50%', '43%', '43%'),
+    ].join(''),
+    household_rows: [
+      aRow('2025 Households', '8,309', '31,809', '42,211'),
+      aRow('Owner Occupied', '3,062', '14,116', '22,116'),
+      aRow('Renter Occupied', '5,724', '19,032', '21,915'),
+      aRow('Avg HH Size', '1.9', '2.0', '2.1'),
+      aRow('Avg Vehicles', '2', '2', '2'),
+      aRow('Consumer Spend', '$234.4M', '$930M', '$1.3B'),
+    ].join(''),
+    income_rows: [
+      aRow('Avg HH Income', '$81,453', '$84,573', '$91,511'),
+      aRow('Median HH Income', '$56,766', '$62,767', '$70,024'),
+      aRow('&lt; $25K', '2,162', '6,238', '7,408'),
+      aRow('$25–50K', '1,597', '6,736', '8,465'),
+      aRow('$50–75K', '1,223', '5,388', '6,437'),
+      aRow('$75–100K', '932', '4,443', '5,807'),
+      aRow('$100–125K', '929', '2,956', '4,384'),
+      aRow('$125–150K', '261', '1,641', '2,774'),
+      aRow('$150–200K', '595', '2,193', '3,634'),
+      aRow('$200K+', '608', '2,213', '3,301'),
+    ].join(''),
+  },
 };
 const DEMO_FALLBACK = "<tr><td colspan='4'>Demographic data available upon request.</td></tr>";
-const POP_FALLBACK = "<tr><td colspan='4'>Population data available upon request.</td></tr>";
-const HH_FALLBACK = "<tr><td colspan='4'>Household &amp; income data available upon request.</td></tr>";
+const POP_FALLBACK = "<div class='analytics-row'><span class='a-label'>Population data available upon request.</span></div>";
+const HH_FALLBACK = "<div class='analytics-row'><span class='a-label'>Household data available upon request.</span></div>";
+const INCOME_FALLBACK = "<div class='analytics-row'><span class='a-label'>Income data available upon request.</span></div>";
 
 function cityKey(subject) {
   return String((subject && subject.city_state_zip) || '').split(',')[0].trim().toLowerCase();

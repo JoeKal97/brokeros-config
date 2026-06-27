@@ -1219,6 +1219,11 @@
   .analytics-row .a-label { color: var(--gray); }
   .analytics-row .a-val { font-weight: 600; color: var(--black); }
 
+  /* aligned 1/3/5-mile value columns (shared by section headers + rows) */
+  .a-cols .r { display: inline-block; width: 52px; text-align: right; }
+  .analytics-row .a-cols .r { font-weight: 600; color: var(--black); }
+  .analytics-source { margin-top: 8px; font-size: 8px; font-style: italic; color: var(--gray-mid); }
+
   .analytics-map {
     flex: 1;
     overflow: hidden;
@@ -1792,9 +1797,9 @@
             <thead>
               <tr>
                 <th>Demographics</th>
-                <th>0.5 Miles</th>
                 <th>1 Mile</th>
-                <th>2.5 Miles</th>
+                <th>3 Miles</th>
+                <th>5 Miles</th>
               </tr>
             </thead>
             <tbody>
@@ -1991,19 +1996,29 @@
           <div class="analytics-section">
             <div class="analytics-section-header">
               <span>Population</span>
-              <span>1 Mile &nbsp;&nbsp; 3 Miles &nbsp;&nbsp; 5 Miles</span>
+              <span class="a-cols"><span class="r">1 Mi</span><span class="r">3 Mi</span><span class="r">5 Mi</span></span>
             </div>
             {{POPULATION_ROWS}}
           </div>
-          
+
           <div class="analytics-section">
             <div class="analytics-section-header">
-              <span>Household &amp; Income</span>
-              <span>1 Mile &nbsp;&nbsp; 3 Miles &nbsp;&nbsp; 5 Miles</span>
+              <span>Households</span>
+              <span class="a-cols"><span class="r">1 Mi</span><span class="r">3 Mi</span><span class="r">5 Mi</span></span>
             </div>
             {{HOUSEHOLD_ROWS}}
           </div>
-          
+
+          <div class="analytics-section">
+            <div class="analytics-section-header">
+              <span>Income</span>
+              <span class="a-cols"><span class="r">1 Mi</span><span class="r">3 Mi</span><span class="r">5 Mi</span></span>
+            </div>
+            {{INCOME_ROWS}}
+          </div>
+
+          <div class="analytics-source">Source: CoStar (ACS-derived) — 1 / 3 / 5-mile rings, centered on the subject property.</div>
+
         </div>
         
         <!-- Right: Concentric circle map -->
