@@ -14,7 +14,7 @@
 export const config = { maxDuration: 60 };
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-17-maps';
+const VERSION = '2026-06-17-headshot-live';
 
 // ---- Per-broker registry (identity + branding + template) -------------------
 const BROKERS = {
@@ -25,7 +25,7 @@ const BROKERS = {
     template_url: 'https://raw.githubusercontent.com/JoeKal97/brokeros-config/main/brokeros-template.html',
     // Bio-page headshot (pilot: hardcoded public URL in the brokeros-photos bucket). Empty -> the
     // grey avatar placeholder renders, unchanged. Per-broker branding record comes with onboarding.
-    headshot_url: '',
+    headshot_url: 'https://rnswcjeqbnmuretlukvw.supabase.co/storage/v1/object/public/brokeros-photos/broker-branding/Jessie%20Eagen%20Headshot.jpg',
     branding: {
       primary_color: '#E8702A',
       secondary_color: '#000000',
