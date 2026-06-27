@@ -10,11 +10,28 @@
 // Contract: docs/BPO-PAYLOAD-SCHEMA.md  (OC sends raw data + prose only; the endpoint
 // is the sole authority on every derived value and all HTML assembly.)
 
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
 // Maps (geocode + static-map fetches) add a few seconds before the PDFShift render.
 export const config = { maxDuration: 60 };
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-17-badges';
+const VERSION = '2026-06-17-tplbundle';
+
+// The template ships INSIDE the function bundle (vercel.json includeFiles) and is read from the local
+// filesystem so every render uses the just-deployed version — no GitHub-raw CDN cache window (which once
+// made a deployed template change look "not applied"). Falls back to fetching the raw URL if the local
+// file is unreadable for any reason, preserving the previous behavior as a safety net.
+const __dirname = dirname(fileURLToPath(import.meta.url));
+let _tplCache;
+function loadLocalTemplate() {
+  if (_tplCache !== undefined) return _tplCache;
+  try { _tplCache = readFileSync(join(__dirname, '..', 'brokeros-template.html'), 'utf8'); }
+  catch (_) { _tplCache = null; }
+  return _tplCache;
+}
 
 // ---- Per-broker registry (identity + branding + template) -------------------
 const BROKERS = {
@@ -517,9 +534,12 @@ export default async function handler(req, res) {
       const broker = BROKERS[payload.broker_id];
       if (!broker) return res.status(400).json({ error: 'Unknown broker_id', detail: String(payload.broker_id) });
 
-      const tplResp = await fetch(broker.template_url);
-      if (!tplResp.ok) return res.status(502).json({ error: 'Template fetch failed', detail: 'HTTP ' + tplResp.status });
-      const tpl = await tplResp.text();
+      let tpl = loadLocalTemplate();
+      if (!tpl) {  // safety net: bundled file unreadable -> fall back to the raw URL (previous behavior)
+        const tplResp = await fetch(broker.template_url);
+        if (!tplResp.ok) return res.status(502).json({ error: 'Template fetch failed', detail: 'HTTP ' + tplResp.status });
+        tpl = await tplResp.text();
+      }
 
       const maps = await buildMaps(payload, process.env.GOOGLE_MAPS_API_KEY); // server-side; null slots keep placeholders
       const vars = buildVars(payload, broker, maps);
