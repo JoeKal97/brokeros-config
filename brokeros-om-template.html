@@ -34,13 +34,16 @@ body { font-family:'Nunito Sans','Segoe UI',Arial,sans-serif; color:#222; backgr
 .content { display:flex; flex-direction:column; }
 .cp-header { background:#F7941E; padding:0.2in 0.55in; flex-shrink:0; }
 .cp-header h1 { font-family:Georgia,serif; color:#fff; font-size:25px; letter-spacing:2px; text-transform:uppercase; }
-.cp-body { flex:1; padding:0.38in 0.55in 0.2in; overflow:hidden; }
+.cp-body { flex:1; min-height:0; padding:0.38in 0.55in 0.2in; overflow:hidden; }
 .cp-footer { display:flex; justify-content:space-between; align-items:center; padding:0 0.55in 0.32in; flex-shrink:0; }
 .pg-block { background:#000; color:#fff; font-family:Georgia,serif; font-size:10.5px; letter-spacing:1.5px; text-transform:uppercase; padding:6px 16px; }
 .addr { font-size:9.5px; color:#444; }
 
 h2.sub { font-family:Georgia,serif; color:#F7941E; font-size:15px; letter-spacing:1px; text-transform:uppercase; margin-bottom:8px; }
 p.body { font-size:12px; line-height:1.7; text-align:justify; margin-bottom:11px; }
+/* long-narrative auto-shrink (Bug 2 — keep the description inside the page, above the footer) */
+.desc-tight p.body { font-size:10.5px; line-height:1.55; margin-bottom:9px; }
+.desc-tighter p.body { font-size:9.5px; line-height:1.45; margin-bottom:8px; }
 table.data { width:100%; border-collapse:collapse; font-size:11px; }
 table.data td, table.data th { padding:5px 6px; border-bottom:1px solid #F7941E; text-align:left; vertical-align:top; }
 table.data td.r, table.data th.r { text-align:right; }

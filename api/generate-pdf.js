@@ -538,11 +538,29 @@ function loadLocalOmTemplate() {
   return _omTplCache;
 }
 
+// Default construction & systems for institutional office (Bug 3) — used when the payload omits
+// `construction`; the agent confirms/edits these during intake.
+const INSTITUTIONAL_OFFICE_CONSTRUCTION = {
+  'Foundation': 'Reinforced concrete',
+  'Framing / Exterior': 'Wood frame, brick veneer',
+  'Roof': 'TPO membrane, heat-welded seams',
+  'Mechanical': 'VAV, rooftop cooling, gas boilers',
+  'Fire Protection': 'Fully sprinklered, monitored',
+  'Elevators': 'Passenger elevators in each 2-story building',
+  'Backup Power': 'Natural-gas generator at each building',
+};
+
 // --- OM small helpers --------------------------------------------------------
 const omParas = (txt) => {
   const arr = Array.isArray(txt) ? txt : String(txt == null ? '' : txt).split(/\n\s*\n/);
   return arr.map((p) => String(p).trim()).filter(Boolean).map((p) => '<p class="body">' + esc(p) + '</p>').join('');
 };
+// Property description with length-based auto-shrink so long narratives stay above the footer (Bug 2).
+function omDesc(txt) {
+  const len = Array.isArray(txt) ? txt.join(' ').length : String(txt == null ? '' : txt).length;
+  const cls = len > 1600 ? 'desc-tighter' : len > 1100 ? 'desc-tight' : '';
+  return '<div class="' + cls + '">' + omParas(txt) + '</div>';
+}
 const httpUrl = (u) => (u && /^https?:\/\//i.test(String(u))) ? String(u) : null;
 // Cover/divider/back full-bleed background: a CSS value, or '' (template's dark gradient fallback shows).
 const omBg = (u) => httpUrl(u) ? "background-image:url('" + esc(httpUrl(u)) + "')" : '';
@@ -610,8 +628,12 @@ function omFinanceVars(fin, priceRaw) {
   const egi = (o) => isNum(num(o.egi)) ? num(o.egi) : (isNum(num(o.gross_rents)) ? num(o.gross_rents) + (num(o.other_income) || 0) : null);
   const noi = (o) => isNum(num(o.noi)) ? num(o.noi) : (isNum(egi(o)) && isNum(num(o.operating_expenses)) ? egi(o) - num(o.operating_expenses) : null);
   const curNoi = noi(cur), pfNoi = noi(pf);
-  const curCap = (isNum(curNoi) && isNum(priceRaw) && priceRaw > 0) ? curNoi / priceRaw * 100 : num(cur.cap_rate);
-  const pfCap = (isNum(pfNoi) && isNum(priceRaw) && priceRaw > 0) ? pfNoi / priceRaw * 100 : num(pf.cap_rate);
+  // Cap rate: a broker-STATED cap_rate (seller's marketing figure) wins for display; otherwise
+  // compute NOI/price. (Computing 1,955,391/47,500,000 = 4.1166% rounds to 4.12 — to publish the
+  // seller's "4.11%" the broker supplies cap_rate: 4.11.) Sensitivity values below always recompute.
+  const computedCap = (n) => (isNum(n) && isNum(priceRaw) && priceRaw > 0) ? n / priceRaw * 100 : null;
+  const curCap = isNum(num(cur.cap_rate)) ? num(cur.cap_rate) : computedCap(curNoi);
+  const pfCap = isNum(num(pf.cap_rate)) ? num(pf.cap_rate) : computedCap(pfNoi);
   const grm = (o, n) => isNum(num(o.grm)) ? num(o.grm) : (isNum(priceRaw) && isNum(n) && n > 0 ? priceRaw / n : null);
   const curGrm = grm(cur, num(cur.gross_rents)), pfGrm = grm(pf, num(pf.gross_rents));
 
@@ -738,14 +760,15 @@ function buildOmVars(payload, broker, maps = {}) {
   }).join('');
   if (p.excluded_note) buildingRows += `<tr><td colspan="2" style="border-bottom:none;padding-top:8px;font-style:italic;color:#777;font-size:9.5px;">${esc(p.excluded_note)}</td></tr>`;
 
-  const constr = payload.construction;
+  // Construction & systems. Use the payload object/array if given; otherwise fall back to the
+  // institutional-office default set (Bug 3 — page 6 was blank when intake never collected this).
+  const constr = (payload.construction && (Array.isArray(payload.construction) ? payload.construction.length : Object.keys(payload.construction).length))
+    ? payload.construction : INSTITUTIONAL_OFFICE_CONSTRUCTION;
   let constrRows;
   if (Array.isArray(constr) && constr.length) {
     constrRows = constr.map((c) => `<tr><td>${esc(c.label || c[0])}:</td><td class="r">${esc(c.value != null ? c.value : c[1])}</td></tr>`).join('');
-  } else if (constr && typeof constr === 'object') {
-    constrRows = Object.entries(constr).map(([k, val]) => `<tr><td>${esc(k)}:</td><td class="r">${esc(val)}</td></tr>`).join('');
   } else {
-    constrRows = `<tr><td colspan="2">Construction &amp; systems detail available upon request.</td></tr>`;
+    constrRows = Object.entries(constr).map(([k, val]) => `<tr><td>${esc(k)}:</td><td class="r">${esc(val)}</td></tr>`).join('');
   }
 
   // Investment highlights — split across two columns
@@ -774,7 +797,7 @@ function buildOmVars(payload, broker, maps = {}) {
     DIVIDER_PHOTO_3_STYLE: omBg(pick(2)), DIVIDER_PHOTO_4_STYLE: omBg(pick(3)),
 
     // property summary
-    PROPERTY_DESCRIPTION: omParas(payload.description || p.description || ''),
+    PROPERTY_DESCRIPTION: omDesc(payload.description || p.description || ''),
     OFFERING_SUMMARY_ROWS: offeringRows,
     OFFERING_SUMMARY_NOTE: omNote(p.offering_note),
 
