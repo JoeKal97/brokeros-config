@@ -18,7 +18,7 @@ import { dirname, join } from 'node:path';
 export const config = { maxDuration: 60 };
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-28-om-2';
+const VERSION = '2026-06-28-om-3';
 
 // The template ships INSIDE the function bundle (vercel.json includeFiles) and is read from the local
 // filesystem so every render uses the just-deployed version — no GitHub-raw CDN cache window (which once
@@ -48,7 +48,18 @@ const BROKERS = {
       secondary_color: '#000000',
       heading_font: 'Playfair Display',
       body_font: 'Barlow'
-    }
+    },
+    // OM identity (source of truth so the agent need not resend static broker data each time).
+    company: 'Eagen Real Estate',
+    website: 'jessieeagen.com',
+    address: '101 E Front St, Suite 304, Missoula, MT 59802',
+    address_block: '101 E Front St, Suite 304<br>Missoula, MT 59802',
+    bio: [
+      'Jessie Eagen is one of the most seasoned and experienced real estate agents in the Missoula area. Surviving 34+ years in Montana real estate, with all of its economic twists and turns, has proven to be a great accomplishment for Jessie. Since his first property sale in 1993 for $112,000, Jessie has remained focused and determined to be a leader in his field.',
+      'Jessie has always been heavily involved in all aspects of real estate — from development of new multi-family projects, building spec homes, and consulting on residential developments to buying and selling homes for himself. With his well-rounded experience in all areas of the industry, Jessie prides himself on being an aggressive negotiator with the foresight to know how to get the deal done.',
+      'Jessie’s personable and professional character allows him to build and maintain solid relationships, which explains why his business has grown mostly from referrals and repeat clients.',
+      'Jessie was born and raised in Great Falls, MT. After graduating from the University of Montana with a business degree, Jessie began his real estate career in 1992 and made Missoula home.',
+    ].join('\n\n')
   }
 };
 

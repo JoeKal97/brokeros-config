@@ -99,14 +99,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // with the address". normCmd folds spoken "B. P. O." -> "bpo" first so dotted/spaced forms match.
 const BARE_START_RE = /^\s*\/?(?:start|new|bpo)\s*$/i;
 const NEWBPO_RE = /\b(?:new|fresh|another)\s+(?:bpo|one|report|valuation|broker'?s?\s+(?:price\s+)?opinion)\b|\b(?:start|begin|create|make|do)\s+(?:an?\s+)?(?:new\s+|fresh\s+|another\s+)?(?:bpo|broker'?s?\s+(?:price\s+)?opinion)\b|\bstart\s+(?:over|fresh|anew)\b/i;
-const normCmd = (s) => String(s || '').replace(/\bb\.?\s*p\.?\s*o\.?\b/gi, 'bpo');
-const isFreshStart = (text) => { const t = normCmd(text); return BARE_START_RE.test(t) || NEWBPO_RE.test(t); };
+// OM (offering memorandum) fresh-start. Requires a fresh-intent word + an OM-ish object (om /
+// offering memorandum), or "OM for <property>" — \bom\b boundaries avoid tripping on "from"/"some".
+const NEWOM_RE = /\b(?:new|fresh|another)\s+(?:om|offering\s+memorandum)\b|\b(?:start|begin|create|make|do)\s+(?:an?\s+)?(?:new\s+|fresh\s+|another\s+)?(?:om|offering\s+memorandum)\b|\bom\s+for\b/i;
+const normCmd = (s) => String(s || '').replace(/\bb\.?\s*p\.?\s*o\.?\b/gi, 'bpo').replace(/\bo\.?\s*m\.?\b/gi, 'om');
+const isFreshStart = (text) => { const t = normCmd(text); return BARE_START_RE.test(t) || NEWBPO_RE.test(t) || NEWOM_RE.test(t); };
 const END_RE = /^\s*\/?(cancel|done|reset|stop)\b/i;
 const RETRY_RE = /^\s*\/?(retry|resend|try\s*again|again|yes|yep|yeah|yup|ok(ay)?|sure|go|please)\b/i; // after a failed generation
 
 // Explicit "make the BPO now" intent -> acknowledge the BUILD immediately (don't wait ~1 min for
 // the agent to decide). Deliberately narrow (clear generate verbs) to avoid firing on plain confirms.
-const GENERATE_INTENT_RE = /\b(generate|build|create|produce|finali[sz]e)\b[^.!?]*\b(bpo|report|pdf|it|this|that)\b|^\s*\/?(generate|build\s*it|make\s*it|create\s*it|generate\s+(the\s+)?bpo|build\s+(the\s+)?bpo|make\s+(the\s+)?bpo|run\s*it|send\s*it|go\s*for\s*it|let'?s\s*go|fire\s*away)\s*$/i;
+const GENERATE_INTENT_RE = /\b(generate|build|create|produce|finali[sz]e)\b[^.!?]*\b(bpo|om|report|pdf|it|this|that)\b|^\s*\/?(generate|build\s*it|make\s*it|create\s*it|generate\s+(the\s+)?(bpo|om)|build\s+(the\s+)?(bpo|om)|make\s+(the\s+)?(bpo|om)|run\s*it|send\s*it|go\s*for\s*it|let'?s\s*go|fire\s*away)\s*$/i;
 
 // STATUS check-in ("you there?", "where's my PDF", "any update", "done yet?") -> answer with
 // real status, not a generic ack.
@@ -534,7 +537,7 @@ async function sendTurn(sessionId, text, deadlineMs) {
 
 // ---- generate signal + PDF delivery ----
 function extractGenerate(reply) {
-  if (!/GENERATE_BPO/.test(reply)) return null;
+  if (!/GENERATE_(?:BPO|OM)/.test(reply)) return null;  // OM payloads carry doc_type:"om"; the endpoint routes
   const fenced = reply.match(/```(?:json|JSON)?\s*(\{[\s\S]*?\})\s*```/);
   const jtxt = fenced ? fenced[1] : (reply.match(/\{[\s\S]*\}/) || [])[0];
   if (!jtxt) return null;
@@ -564,27 +567,31 @@ async function generatePdf(payload) {
 // Bridge owns ALL "building / sent / failed" messaging, driven by real results. The agent
 // never speaks to delivery. On failure we keep the stashed payload so a retry can re-run.
 async function runGeneration(token, chatId, payload, opts = {}) {
+  const isOm = payload && payload.doc_type === 'om';       // BPO vs OM delivery wording/filename
+  const DOC = isOm ? 'OM' : 'BPO';
   await sbMarkGenerating(chatId, payload);                 // stash payload + extend the turn lock
-  if (!opts.ackedBuilding) await sendMessage(token, chatId, 'Building your BPO now ⏳'); // skip if already acked on generate-intent
+  if (!opts.ackedBuilding) await sendMessage(token, chatId, `Building your ${DOC} now ⏳`); // skip if already acked on generate-intent
   const result = await generatePdf(payload);
 
   if (result.ok) {
-    const addr = (payload.subject && payload.subject.address_line1) || 'BPO';
-    const fname = `Eagen_BPO_${String(addr).replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '')}.pdf`;
+    const addr = isOm
+      ? ((payload.property && (payload.property.name || payload.property.address_line1)) || 'OM')
+      : ((payload.subject && payload.subject.address_line1) || 'BPO');
+    const fname = `Eagen_${DOC}_${String(addr).replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '')}.pdf`;
     if (await sendDocument(token, chatId, result.bytes, fname)) {  // attach FIRST
-      await sendMessage(token, chatId, '✅ Your BPO is ready. Spot an error? Tell me the fix (e.g. “change the asking price to 1.6M”) and I’ll update it — or say “new BPO” to start another.');
+      await sendMessage(token, chatId, `✅ Your ${DOC} is ready. Spot an error? Tell me the fix and I’ll update it — or say “new ${DOC}” to start another.`);
       await sbMarkDelivered(chatId);                               // keep the session for post-delivery edits
       return true;
     }
     console.error('sendDocument failed for chat', chatId);
-    await sendMessage(token, chatId, '⚠️ I built your BPO but couldn’t attach it. Reply "retry" to resend.');
+    await sendMessage(token, chatId, `⚠️ I built your ${DOC} but couldn’t attach it. Reply "retry" to resend.`);
     await sbMarkFailed(chatId);
     return false;
   }
 
   console.error('generate-pdf failed:', result.status, result.kind, result.detail);
   const msg = result.kind === 'credits'
-    ? '⚠️ The PDF service is temporarily unavailable. Your BPO is saved — reply "retry" and I’ll finish it as soon as it’s back.'
+    ? `⚠️ The PDF service is temporarily unavailable. Your ${DOC} is saved — reply "retry" and I’ll finish it as soon as it’s back.`
     : '⚠️ Hit a snag building the PDF. Reply "retry" to try again.';
   await sendMessage(token, chatId, msg);
   await sbMarkFailed(chatId);
@@ -673,7 +680,7 @@ async function runTurn(token, chatId, incoming, ctx) {
   if (payload) { await runGeneration(token, chatId, payload, { ackedBuilding: buildAcked }); return; }
 
   await sbTouch(chatId);
-  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
+  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM)\s*/i, '').trim() || reply);
 }
 
 // An xlsx arrived: download -> parse -> inject parsed tenants into the chat's session so the
@@ -767,7 +774,7 @@ async function injectCompsAndReply(token, chatId, comps) {
   const payload = extractGenerate(reply);
   if (payload) { await runGeneration(token, chatId, payload); return; }
   await sbTouch(chatId);
-  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
+  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM)\s*/i, '').trim() || reply);
 }
 
 // A comp PDF arrived: download -> parse-comp-pdf -> upload the extracted photo to Supabase ->
@@ -930,7 +937,7 @@ async function injectPhotosAndReply(token, chatId, urls) {
   const payload = extractGenerate(reply);
   if (payload) { await runGeneration(token, chatId, payload); return; }
   await sbTouch(chatId);
-  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
+  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM)\s*/i, '').trim() || reply);
 }
 
 // A PHOTO arrived: grab bytes (tg-7), store in the bucket, append it to the batch buffer; the settler
