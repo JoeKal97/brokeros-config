@@ -801,7 +801,7 @@ function buildOmVars(payload, broker, maps = {}) {
     RING_1: demo && demo.rings ? esc(demo.rings[0] || '') : '',
     RING_2: demo && demo.rings ? esc(demo.rings[1] || '') : '',
     RING_3: demo && demo.rings ? esc(demo.rings[2] || '') : '',
-    DEMO_MAP_IMG: omImg(maps.demoRing, { style: 'max-height:6.8in;max-width:100%', phText: 'Demographics Map' }),
+    DEMO_MAP_IMG: omImg(httpUrl(photos.demographics_map_url) || maps.demoRing, { style: 'max-height:6.8in;max-width:100%', phText: 'Demographics Map' }),
     DEMO_POP_ROWS: demo ? omDemoRows(demo.population) : '',
     DEMO_HH_ROWS: demo ? omDemoRows(demo.households) : '',
     DEMO_SOURCE: demo && demo.source ? esc(demo.source) : '',
@@ -830,12 +830,17 @@ async function buildOmMaps(payload, key) {
   const photos = payload.photos || {};
   const demo = payload.demographics || null;
   const addrFull = p.address || [p.address_line1, p.city_state_zip].filter(Boolean).join(', ');
+  // Geocodable address: a multi-building range like "2673–2687 Palmer St" won't geocode, so collapse
+  // the range to its first number (or use an explicit property.geocode_address override).
+  const cityZip = p.city_state_zip || (p.address ? String(p.address).split(',').slice(1).join(',').trim() : '');
+  const geoAddr = p.geocode_address
+    || [String(p.address_line1 || addrFull).replace(/(\d+)\s*[–—-]\s*\d+/, '$1'), cityZip].filter(Boolean).join(', ');
   // Aerial: only generate a satellite map if the broker did NOT supply an aerial image.
-  const aerialP = httpUrl(photos.aerial_url) ? Promise.resolve(null) : omSatelliteAerial(addrFull, key);
+  const aerialP = httpUrl(photos.aerial_url) ? Promise.resolve(null) : omSatelliteAerial(geoAddr, key);
   // Demographics ring map: parse ring miles from the ring labels ("0.5 Miles" -> 0.5).
   const ringMiles = demo && Array.isArray(demo.rings)
     ? demo.rings.map((s) => parseFloat(String(s))).filter((n) => isFinite(n)) : [];
-  const ringP = demo ? omRingMap(addrFull, ringMiles, key) : Promise.resolve(null);
+  const ringP = demo ? omRingMap(geoAddr, ringMiles, key) : Promise.resolve(null);
   const [aerial, demoRing] = await Promise.all([aerialP, ringP]);
   return { aerial, demoRing };
 }
