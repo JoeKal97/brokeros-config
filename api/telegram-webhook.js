@@ -102,7 +102,14 @@ const NEWBPO_RE = /\b(?:new|fresh|another)\s+(?:bpo|one|report|valuation|broker'
 // OM (offering memorandum) fresh-start. Requires a fresh-intent word + an OM-ish object (om /
 // offering memorandum), or "OM for <property>" — \bom\b boundaries avoid tripping on "from"/"some".
 const NEWOM_RE = /\b(?:new|fresh|another)\s+(?:om|offering\s+memorandum)\b|\b(?:start|begin|create|make|do)\s+(?:an?\s+)?(?:new\s+|fresh\s+|another\s+)?(?:om|offering\s+memorandum)\b|\bom\s+for\b/i;
-const normCmd = (s) => String(s || '').replace(/\bb\.?\s*p\.?\s*o\.?\b/gi, 'bpo').replace(/\bo\.?\s*m\.?\b/gi, 'om');
+// Fold dotted/spoken acronyms the voice path mangles. BPO fold runs FIRST so "b.p.o." is consumed
+// before the OM fold (otherwise its trailing "p.o." would mis-fold to OM). The OM fold also catches
+// common Whisper mis-transcriptions of spoken "OM": "O.M.", "oh em", "ohm", "peo", "p.o." — the
+// "p.o." form requires a literal period so plain "PO box" is left alone. NOTE: a bare "p.o." (no
+// leading b) is treated as OM; a BPO dictated all the way down to "p.o." would mis-route here.
+const normCmd = (s) => String(s || '')
+  .replace(/\bb\.?\s*p\.?\s*o\.?\b/gi, 'bpo')
+  .replace(/\b(?:o\.?\s*m\.?|oh[\s-]*em|ohm|peo|p\.\s*o\.?)\b/gi, 'om');
 const isFreshStart = (text) => { const t = normCmd(text); return BARE_START_RE.test(t) || NEWBPO_RE.test(t) || NEWOM_RE.test(t); };
 const END_RE = /^\s*\/?(cancel|done|reset|stop)\b/i;
 const RETRY_RE = /^\s*\/?(retry|resend|try\s*again|again|yes|yep|yeah|yup|ok(ay)?|sure|go|please)\b/i; // after a failed generation
@@ -1021,9 +1028,13 @@ export default async function handler(req, res) {
   // voice transcript flows through against spoken/typed variants + data decoys. ok=true means every
   // "new BPO" spoken form is caught, every generate form is caught, and NO data string is misread.
   if (req.method === 'GET' && req.query && req.query.selftest === 'voicecmd') {
-    const START = ['new BPO', 'new bpo', 'a new BPO', 'start a new BPO', 'new B.P.O.', 'new B. P. O.', 'start a new one', "let's start a new one", 'start over', 'start fresh', 'begin a new BPO', 'create a new one', 'another BPO', 'do a new valuation', 'okay, can we start a new BPO please', '/new', 'BPO', 'start a bpo'];
-    const GEN = ['generate the BPO', 'build it', 'make the bpo', 'go for it', 'generate', 'build the report', 'run it', "let's go"];
-    const DATA = ['the property is new construction', 'new listing on Higgins', 'start with the address 123 Main St', 'the new owner took over in 2020', 'new roof installed last year', 'I have one more comp coming', 'the asking price is 1.6 million', 'starting the financials at 96k NOI', 'do a new comp photo', 'make it a corner unit'];
+    const START = ['new BPO', 'new bpo', 'a new BPO', 'start a new BPO', 'new B.P.O.', 'new B. P. O.', 'start a new one', "let's start a new one", 'start over', 'start fresh', 'begin a new BPO', 'create a new one', 'another BPO', 'do a new valuation', 'okay, can we start a new BPO please', '/new', 'BPO', 'start a bpo',
+      // OM fresh-starts incl. common Whisper mis-transcriptions of spoken "OM"
+      'new OM', 'new offering memorandum', 'start an OM', 'OM for Palmer Professional Park', 'another OM', 'new O.M.', 'new oh em', 'new ohm', 'new peo', 'new P.O.'];
+    const GEN = ['generate the BPO', 'build it', 'make the bpo', 'go for it', 'generate', 'build the report', 'run it', "let's go", 'generate the OM', 'build the om'];
+    const DATA = ['the property is new construction', 'new listing on Higgins', 'start with the address 123 Main St', 'the new owner took over in 2020', 'new roof installed last year', 'I have one more comp coming', 'the asking price is 1.6 million', 'starting the financials at 96k NOI', 'do a new comp photo', 'make it a corner unit',
+      // OM-adjacent decoys that must NOT trip OM/BPO routing
+      'new PO box', 'my P.O. box number', 'the peony lane listing', 'a promo flyer went out'];
     const startMiss = START.filter((s) => !isFreshStart(s));
     const genMiss = GEN.filter((s) => !GENERATE_INTENT_RE.test(s));
     const dataFalse = DATA.filter((s) => isFreshStart(s) || GENERATE_INTENT_RE.test(s));

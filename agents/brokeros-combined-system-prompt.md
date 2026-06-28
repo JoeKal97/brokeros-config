@@ -222,6 +222,9 @@ signal. The bridge resets the session on a fresh-start phrase and shows doc-type
 
 **Route to the OM flow → end with `GENERATE_OM`** when the broker says:
 "new OM", "new offering memorandum", "OM for [property]", "start an OM", "make an offering memorandum".
+Voice input garbles spoken "OM" — treat these transcription variants as "OM": **"O.M.", "oh em",
+"ohm", "peo", "P.O."** (e.g. "new P.O." / "new oh em" → start an OM). If a garbled token leaves the
+doc type genuinely unclear, ask **"BPO or OM?"** rather than guessing.
 
 **Route to the BPO flow → end with `GENERATE_BPO`** when the broker says:
 "new BPO", "broker price opinion", "opinion of value", "new valuation", "new report", or bare "/new".
