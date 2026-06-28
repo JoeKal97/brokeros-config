@@ -6,7 +6,7 @@
     },
     "api/generate-pdf.js": {
       "maxDuration": 60,
-      "includeFiles": "brokeros-template.html"
+      "includeFiles": "{brokeros-template.html,brokeros-om-template.html}"
     }
   }
 }

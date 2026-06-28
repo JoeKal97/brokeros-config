@@ -18,7 +18,7 @@ import { dirname, join } from 'node:path';
 export const config = { maxDuration: 60 };
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-17-tplbundle';
+const VERSION = '2026-06-28-om';
 
 // The template ships INSIDE the function bundle (vercel.json includeFiles) and is read from the local
 // filesystem so every render uses the just-deployed version — no GitHub-raw CDN cache window (which once
@@ -510,6 +510,367 @@ const BULLSEYE_FALLBACK =
   '<div style="width:10px;height:10px;border-radius:50%;background:var(--orange);position:absolute;"></div>' +
   '</div></div>';
 
+// ============================================================================
+// OM (Offering Memorandum) ASSEMBLY  —  doc_type === "om"
+// Same machine as the BPO: bundled template, {{TOKEN}} fill, <!--OPT--> pages,
+// form-urlencoded payload=, server-side math. Portrait 8.5x11.
+// Contract: docs/OM-PAYLOAD-SCHEMA.md
+// ============================================================================
+
+// OM template ships in the function bundle (vercel.json includeFiles), same pattern as the BPO.
+const OM_TEMPLATE_URL = 'https://raw.githubusercontent.com/JoeKal97/brokeros-config/main/brokeros-om-template.html';
+let _omTplCache;
+function loadLocalOmTemplate() {
+  if (_omTplCache !== undefined) return _omTplCache;
+  try { _omTplCache = readFileSync(join(__dirname, '..', 'brokeros-om-template.html'), 'utf8'); }
+  catch (_) { _omTplCache = null; }
+  return _omTplCache;
+}
+
+// --- OM small helpers --------------------------------------------------------
+const omParas = (txt) => {
+  const arr = Array.isArray(txt) ? txt : String(txt == null ? '' : txt).split(/\n\s*\n/);
+  return arr.map((p) => String(p).trim()).filter(Boolean).map((p) => '<p class="body">' + esc(p) + '</p>').join('');
+};
+const httpUrl = (u) => (u && /^https?:\/\//i.test(String(u))) ? String(u) : null;
+// Cover/divider/back full-bleed background: a CSS value, or '' (template's dark gradient fallback shows).
+const omBg = (u) => httpUrl(u) ? "background-image:url('" + esc(httpUrl(u)) + "')" : '';
+// Content <img> for a URL (or a grey placeholder of the same footprint when absent).
+function omImg(u, { style = '', cls = 'full-img', phCls = 'img-ph-lg', phText = 'Image' } = {}) {
+  const url = httpUrl(u);
+  return url
+    ? '<img class="' + cls + '" src="' + esc(url) + '"' + (style ? ' style="' + style + '"' : '') + '>'
+    : '<div class="' + phCls + '"' + (style ? ' style="' + style + '"' : '') + '>' + esc(phText) + '</div>';
+}
+// Photo grid cells: <img> per URL; pad with grey cells so a sparse page still reads as a grid.
+function omGrid(urls, min = 0) {
+  const list = (urls || []).map(httpUrl).filter(Boolean);
+  let cells = list.map((u) => '<img src="' + esc(u) + '">').join('');
+  for (let i = list.length; i < min; i++) cells += '<div class="photo-ph">Photo</div>';
+  return cells || '<div class="photo-ph">Photo</div>';
+}
+const omNote = (txt) => txt ? '<p class="note">' + esc(txt) + '</p>' : '';
+const liList = (arr) => (Array.isArray(arr) ? arr : []).map((x) => {
+  // allow an optional **bold lead** — text before " — " (em or hyphen) renders bold
+  const s = String(x);
+  return '<li>' + esc(s) + '</li>';
+}).join('');
+
+// --- OM static demographics ring map (rings come from the payload, e.g. 0.5/1/2.5) ----
+async function omRingMap(addressFull, ringMiles, key) {
+  if (!key || !addressFull || !ringMiles || !ringMiles.length) return null;
+  const loc = await geocode(addressFull, key);
+  const sloc = parseLoc(loc);
+  if (!sloc) return null;
+  const [la, ln] = sloc;
+  const maxR = Math.max(...ringMiles);
+  const visible = fitVisible([
+    `${la + maxR / 69},${ln}`, `${la - maxR / 69},${ln}`,
+    `${la},${ln + maxR / (69 * Math.cos(la * Math.PI / 180))}`, `${la},${ln - maxR / (69 * Math.cos(la * Math.PI / 180))}`,
+  ], 0.08);
+  const fills = ['0xE8702A14', '0xE8702A1F', '0xE8702A33'];
+  const sorted = [...ringMiles].sort((a, b) => b - a); // largest first so smaller draw on top
+  const rings = sorted.map((r, i) => circlePath(la, ln, r, fills[i] || '0xE8702A33'));
+  return staticMap(['size=600x540', 'scale=2', ...(visible ? [visible] : []), ...rings, mk(MAP_ORANGE, '', loc)], key);
+}
+// Satellite aerial (only when no broker-supplied aerial image is given).
+async function omSatelliteAerial(addressFull, key) {
+  if (!key || !addressFull) return null;
+  const loc = await geocode(addressFull, key);
+  if (!loc) return null;
+  return staticMap([`center=${encodeURIComponent(loc)}`, 'zoom=16', 'size=640x520', 'scale=2', 'maptype=satellite', mk(MAP_ORANGE, '', loc)], key);
+}
+
+// --- OM financial math (the endpoint is the sole authority on every number) ---
+const capValue = (noi, ratePct) => (isNum(noi) && isNum(ratePct) && ratePct > 0) ? noi / (ratePct / 100) : null;
+function amortAnnual(principal, ratePct, years) {
+  if (!isNum(principal) || !isNum(years) || years <= 0) return null;
+  const r = (ratePct || 0) / 100 / 12, n = years * 12;
+  if (!r) return principal / years;
+  const f = Math.pow(1 + r, n);
+  return principal * r * f / (f - 1) * 12;
+}
+
+function omFinanceVars(fin, priceRaw) {
+  const cur = (fin && fin.current) || {};
+  const pf = (fin && fin.pro_forma) || {};
+  const v = {};
+  // EGI / NOI fall back to computed values when not explicitly provided.
+  const egi = (o) => isNum(num(o.egi)) ? num(o.egi) : (isNum(num(o.gross_rents)) ? num(o.gross_rents) + (num(o.other_income) || 0) : null);
+  const noi = (o) => isNum(num(o.noi)) ? num(o.noi) : (isNum(egi(o)) && isNum(num(o.operating_expenses)) ? egi(o) - num(o.operating_expenses) : null);
+  const curNoi = noi(cur), pfNoi = noi(pf);
+  const curCap = (isNum(curNoi) && isNum(priceRaw) && priceRaw > 0) ? curNoi / priceRaw * 100 : num(cur.cap_rate);
+  const pfCap = (isNum(pfNoi) && isNum(priceRaw) && priceRaw > 0) ? pfNoi / priceRaw * 100 : num(pf.cap_rate);
+  const grm = (o, n) => isNum(num(o.grm)) ? num(o.grm) : (isNum(priceRaw) && isNum(n) && n > 0 ? priceRaw / n : null);
+  const curGrm = grm(cur, num(cur.gross_rents)), pfGrm = grm(pf, num(pf.gross_rents));
+
+  const row3 = (lbl, a, b, hl) => `<tr${hl ? ' class="hl"' : ''}><td>${lbl}</td><td class="r">${a}</td><td class="r">${b}</td></tr>`;
+  v.FIN_INCOME_ROWS = [
+    row3('Scheduled Gross Rents', money(num(cur.gross_rents)), money(num(pf.gross_rents))),
+    row3('Other Income / Recoveries', money(num(cur.other_income)), money(num(pf.other_income))),
+    row3('Effective Gross Income', money(egi(cur)), money(egi(pf))),
+    row3('Operating Expenses', money(num(cur.operating_expenses)), money(num(pf.operating_expenses))),
+    row3('Net Operating Income', money(curNoi), money(pfNoi), true),
+  ].join('');
+  v.FIN_METRICS_ROWS = [
+    row3('Offering Price', money(priceRaw), money(priceRaw)),
+    row3('Price / SF', psf(num(cur.price_per_sf)), psf(num(pf.price_per_sf))),
+    row3('Cap Rate', pct(curCap, 2), pct(pfCap, 2), true),
+    row3('GRM', isNum(curGrm) ? curGrm.toFixed(2) : DASH, isNum(pfGrm) ? pfGrm.toFixed(2) : DASH),
+    row3('NOI', money(curNoi), money(pfNoi)),
+  ].join('');
+
+  // Cap-rate sensitivity: a standard ladder plus the actual current/pro-forma caps, computed from NOI.
+  const ladder = new Set([5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0]);
+  if (isNum(curCap)) ladder.add(Math.round(curCap * 100) / 100);
+  if (isNum(pfCap)) ladder.add(Math.round(pfCap * 100) / 100);
+  const rates = [...ladder].sort((a, b) => a - b);
+  const isCap = (r) => (isNum(curCap) && Math.abs(r - curCap) < 0.005) || (isNum(pfCap) && Math.abs(r - pfCap) < 0.005);
+  v.CAP_SENSITIVITY_ROWS = rates.map((r) =>
+    `<tr${isCap(r) ? ' class="hl"' : ''}><td>${pct(r, 2)}</td><td class="r">${money(capValue(curNoi, r))}</td><td class="r">${money(capValue(pfNoi, r))}</td></tr>`
+  ).join('');
+
+  // Debt & cash flow: compute each LTV column from price, rate, amortization, and pro-forma NOI.
+  const debt = (fin && fin.debt) || {};
+  const ltvs = Array.isArray(debt.ltvs) && debt.ltvs.length ? debt.ltvs : [0.60, 0.65];
+  const rate = isNum(num(debt.rate)) ? num(debt.rate) : 6.5;
+  const amYears = isNum(num(debt.amortization_years)) ? num(debt.amortization_years) : 25;
+  const dNoi = isNum(pfNoi) ? pfNoi : curNoi; // stabilized cash flow
+  const cols = ltvs.slice(0, 2).map((ltv) => {
+    const loan = isNum(priceRaw) ? priceRaw * ltv : null;
+    const equity = (isNum(priceRaw) && isNum(loan)) ? priceRaw - loan : null;
+    const ads = amortAnnual(loan, rate, amYears);
+    const cf = (isNum(dNoi) && isNum(ads)) ? dNoi - ads : null;
+    const coc = (isNum(cf) && isNum(equity) && equity > 0) ? cf / equity * 100 : null;
+    const dscr = (isNum(dNoi) && isNum(ads) && ads > 0) ? dNoi / ads : null;
+    return { ltv, loan, equity, ads, cf, coc, dscr };
+  });
+  const drow = (lbl, fn) => `<tr><td>${lbl}</td>` + cols.map((c) => `<td class="r">${fn(c)}</td>`).join('') + '</tr>';
+  // header LTV labels are filled by the template; here we just emit body rows
+  v.DEBT_ROWS = [
+    drow('Loan Amount', (c) => money(c.loan)),
+    drow('Equity Required', (c) => money(c.equity)),
+    drow('Interest Rate', () => pct(rate, 2)),
+    drow('Amortization', () => amYears + ' yrs'),
+    drow('Annual Debt Service', (c) => money(c.ads)),
+    drow('Cash Flow After Debt Service', (c) => money(c.cf)),
+    drow('Cash-on-Cash Return', (c) => pct(c.coc, 2)),
+    drow('Debt Coverage Ratio', (c) => isNum(c.dscr) ? c.dscr.toFixed(2) : DASH),
+  ].join('');
+  // If the payload only supplies 60/65 the template's static "60% LTV / 65% LTV" headers are correct;
+  // when other LTVs are supplied we rewrite those header cells later via DEBT_COL headers.
+  v.DEBT_COL_1 = (ltvs[0] != null) ? Math.round(ltvs[0] * 100) + '% LTV' : '60% LTV';
+  v.DEBT_COL_2 = (ltvs[1] != null) ? Math.round(ltvs[1] * 100) + '% LTV' : '65% LTV';
+
+  v.VALUATION_SUMMARY_ROWS = [
+    `<tr class="hl"><th>Offering Price</th><th class="r">${money(priceRaw)}</th></tr>`,
+    `<tr><td>Price / SF</td><td class="r">${psf(num(cur.price_per_sf))}</td></tr>`,
+    `<tr><td>Current NOI</td><td class="r">${money(curNoi)}</td></tr>`,
+    `<tr><td>Current Cap Rate</td><td class="r">${pct(curCap, 2)}</td></tr>`,
+    `<tr><td>Pro Forma NOI</td><td class="r">${money(pfNoi)}</td></tr>`,
+    `<tr><td>Pro Forma Cap Rate</td><td class="r">${pct(pfCap, 2)}</td></tr>`,
+    `<tr><td>GRM (Current)</td><td class="r">${isNum(curGrm) ? curGrm.toFixed(2) : DASH}</td></tr>`,
+  ].join('');
+  return v;
+}
+
+// --- Build the full OM {{TOKEN}} map ----------------------------------------
+function buildOmVars(payload, broker, maps = {}) {
+  const p = payload.property || {};
+  const photos = payload.photos || {};
+  const fin = payload.financials || {};
+  const market = payload.market || {};
+  const demo = payload.demographics || null;
+  const pend = new Set(Array.isArray(payload.pending_chips) ? payload.pending_chips : []);
+  const pLabel = payload.pending_label || 'TO CONFIRM';
+  const chip = (key) => pend.has(key) ? ' <span class="pending">PENDING — ' + esc(pLabel) + '</span>' : '';
+
+  const priceRaw = num(p.price_raw);
+  const priceStr = p.price ? esc(p.price) : money(priceRaw);
+  const addrFull = p.address || [p.address_line1, p.city_state_zip].filter(Boolean).join(', ');
+  // address split: prefer explicit line1/city, else split a combined string on the last comma group
+  let line1 = p.address_line1, cityZip = p.city_state_zip;
+  if (!line1 && p.address) {
+    const parts = String(p.address).split(',');
+    line1 = parts.shift().trim();
+    cityZip = parts.join(',').trim();
+  }
+
+  // photo distribution: cover hero, then property photos cycle through the four section dividers + back.
+  const propUrls = (Array.isArray(photos.property_urls) ? photos.property_urls : []).map(httpUrl).filter(Boolean);
+  const coverUrl = httpUrl(photos.cover_url) || propUrls[0] || null;
+  const pick = (i) => propUrls.length ? propUrls[i % propUrls.length] : null;
+
+  const offeringRows = [
+    ['Sale Price', '<b>' + priceStr + '</b>', null],
+    ['Address', esc(addrFull), null],
+    ['Total Building Area', (p.total_sf ? esc(p.total_sf) : DASH) + chip('total_sf'), null],
+    ['Buildings', p.buildings_desc ? esc(p.buildings_desc) : (isNum(num(p.num_buildings)) ? num(p.num_buildings) + ' buildings' : DASH), null],
+    ['Site Size', (p.site_acres ? esc(p.site_acres) + ' acres' : DASH).replace(' acres acres', ' acres') + chip('site_acres'), null],
+    ['Occupancy', (p.occupancy ? esc(p.occupancy) : DASH) + chip('occupancy'), null],
+    ['Parking', p.parking_spaces ? esc(p.parking_spaces) + ' spaces' : DASH, null],
+    ['Year Built', p.year_built ? esc(p.year_built) : DASH, null],
+    ['Zoning', p.zoning ? esc(p.zoning) : DASH, null],
+    ['Ownership Entity', p.ownership_entity ? esc(p.ownership_entity) : DASH, null],
+  ].map(([l, val]) => `<tr><td>${l}:</td><td class="r">${val}</td></tr>`).join('');
+
+  // Property profile — buildings list + construction/systems
+  const blds = Array.isArray(payload.buildings) ? payload.buildings : [];
+  let buildingRows = '';
+  if (p.zoning) buildingRows += `<tr><td>Zoning:</td><td class="r">${esc(p.zoning)}</td></tr>`;
+  if (p.permitted_uses) buildingRows += `<tr><td>Permitted Uses:</td><td class="r">${esc(p.permitted_uses)}</td></tr>`;
+  buildingRows += blds.map((b) => {
+    const sf = isNum(num(b.sf)) ? sfNum(num(b.sf)) + ' SF' : (b.sf ? esc(b.sf) : DASH);
+    const use = b.use ? ' ' + esc(b.use) : '';
+    const c = b.pending ? ' <span class="pending">PENDING — ' + esc(pLabel) + '</span>' : '';
+    return `<tr><td>${esc(b.address)}:</td><td class="r">${sf}${use}${c}</td></tr>`;
+  }).join('');
+  if (p.excluded_note) buildingRows += `<tr><td colspan="2" style="border-bottom:none;padding-top:8px;font-style:italic;color:#777;font-size:9.5px;">${esc(p.excluded_note)}</td></tr>`;
+
+  const constr = payload.construction;
+  let constrRows;
+  if (Array.isArray(constr) && constr.length) {
+    constrRows = constr.map((c) => `<tr><td>${esc(c.label || c[0])}:</td><td class="r">${esc(c.value != null ? c.value : c[1])}</td></tr>`).join('');
+  } else if (constr && typeof constr === 'object') {
+    constrRows = Object.entries(constr).map(([k, val]) => `<tr><td>${esc(k)}:</td><td class="r">${esc(val)}</td></tr>`).join('');
+  } else {
+    constrRows = `<tr><td colspan="2">Construction &amp; systems detail available upon request.</td></tr>`;
+  }
+
+  // Investment highlights — split across two columns
+  const hls = Array.isArray(payload.investment_highlights) ? payload.investment_highlights : [];
+  const mid = Math.ceil(hls.length / 2);
+
+  const vars = {
+    // identity / branding
+    COMPANY: esc(broker.company || broker.name || ''),
+    BROKER_NAME: esc(broker.name), BROKER_PHONE: esc(broker.phone), BROKER_EMAIL: esc(broker.email),
+    BROKER_WEBSITE: esc(broker.website || ''),
+    BROKER_ADDRESS_BLOCK: (broker.address_block || esc(broker.address || '')),
+    BROKER_HEADSHOT: omImg(broker.headshot_url, { style: 'width:100%;max-height:4.6in;object-fit:cover;object-position:top', cls: '', phCls: 'photo-ph', phText: 'Headshot' }),
+    BROKER_BIO: omParas(broker.bio || payload.broker_bio || ''),
+    FOOTER_RIGHT: [broker.address, broker.phone, broker.website ? '<b>' + esc(broker.website) + '</b>' : ''].filter(Boolean)
+      .map((x, i) => i === 2 ? x : esc(x)).join(' &nbsp;|&nbsp; '),
+
+    // cover / back
+    PRICE: priceStr,
+    PROPERTY_NAME: esc(p.name || ''),
+    PROPERTY_NAME_BR: esc(p.name || '').replace(/ /g, '<br>'),
+    ADDRESS_LINE1: esc(line1 || ''), CITY_STATE_ZIP: esc(cityZip || ''), ADDRESS_FULL: esc(addrFull),
+    COVER_PHOTO_STYLE: omBg(coverUrl),
+    BACK_PHOTO_STYLE: omBg(httpUrl(photos.back_url) || coverUrl),
+    DIVIDER_PHOTO_1_STYLE: omBg(pick(0)), DIVIDER_PHOTO_2_STYLE: omBg(pick(1)),
+    DIVIDER_PHOTO_3_STYLE: omBg(pick(2)), DIVIDER_PHOTO_4_STYLE: omBg(pick(3)),
+
+    // property summary
+    PROPERTY_DESCRIPTION: omParas(payload.description || p.description || ''),
+    OFFERING_SUMMARY_ROWS: offeringRows,
+    OFFERING_SUMMARY_NOTE: omNote(p.offering_note),
+
+    // highlights
+    HIGHLIGHTS_COL1: liList(hls.slice(0, mid)),
+    HIGHLIGHTS_COL2: liList(hls.slice(mid)),
+    HIGHLIGHT_PHOTOS: omGrid(propUrls.slice(0, 3), 3),
+
+    // profile
+    BUILDING_ROWS: buildingRows,
+    CONSTRUCTION_ROWS: constrRows,
+    CONSTRUCTION_NOTE: omNote(p.construction_note),
+
+    // photographs
+    PHOTO_GRID_1: omGrid(propUrls.slice(0, 9), 3),
+    PHOTO_GRID_2: omGrid(propUrls.slice(9, 15)),
+    PHOTOS_NOTE: omNote(photos.note),
+
+    // site plan / aerial
+    SITE_PLAN_IMG: omImg(httpUrl(photos.site_plan_url), { style: 'max-height:7.2in;max-width:100%', phText: 'Site Plan' }),
+    SITE_PLAN_NOTE: omNote(photos.site_plan_note),
+    AERIAL_IMG: omImg(httpUrl(photos.aerial_url) || maps.aerial, { style: 'max-height:7.2in;max-width:100%', phText: 'Aerial' }),
+    AERIAL_NOTE: omNote(photos.aerial_note),
+
+    // market
+    MARKET_TITLE: esc(market.title || (market.city ? market.city + (market.state ? ', ' + market.state : '') : 'Market Overview')),
+    MARKET_NARRATIVE: omParas(market.narrative || ''),
+    MARKET_PHOTO: omImg(httpUrl(market.photo_url) || pick(4), { style: 'width:100%;height:5.6in;object-fit:cover', cls: '', phCls: 'photo-ph', phText: 'Market Photo' }),
+    MARKET_PHOTO_NOTE: omNote(market.photo_caption),
+
+    // financial summary (all server-side math)
+    ...omFinanceVars(fin, priceRaw),
+
+    // demographics
+    RING_1: demo && demo.rings ? esc(demo.rings[0] || '') : '',
+    RING_2: demo && demo.rings ? esc(demo.rings[1] || '') : '',
+    RING_3: demo && demo.rings ? esc(demo.rings[2] || '') : '',
+    DEMO_MAP_IMG: omImg(maps.demoRing, { style: 'max-height:6.8in;max-width:100%', phText: 'Demographics Map' }),
+    DEMO_POP_ROWS: demo ? omDemoRows(demo.population) : '',
+    DEMO_HH_ROWS: demo ? omDemoRows(demo.households) : '',
+    DEMO_SOURCE: demo && demo.source ? esc(demo.source) : '',
+
+    FIN_NOTE: omNote(fin.note || 'A detailed operating statement, normalized pro forma, and trailing financials will be made available to qualified purchasers upon execution of a confidentiality agreement. All figures are subject to verification in due diligence.'),
+  };
+  return vars;
+}
+
+// Demographics section rows. Accepts either:
+//   { labels:[...], "0.5 mi":[...] } style  -> not used; we use the labeled-metric form below.
+//   { metric_key: { label, values:[v1,v2,v3] }, ... } OR { label: [v1,v2,v3] }
+function omDemoRows(section) {
+  if (!section) return '';
+  const rows = Array.isArray(section) ? section : Object.entries(section).map(([k, v]) =>
+    (v && typeof v === 'object' && !Array.isArray(v)) ? { label: v.label || k, values: v.values || [] } : { label: k, values: v });
+  const fmt = (x) => (typeof x === 'number' && isFinite(x)) ? x.toLocaleString('en-US') : esc(x);
+  return rows.map((r) => {
+    const vals = Array.isArray(r.values) ? r.values : [];
+    return `<tr><td>${esc(r.label)}</td>` + [0, 1, 2].map((i) => `<td class="r">${vals[i] != null ? fmt(vals[i]) : DASH}</td>`).join('') + '</tr>';
+  }).join('');
+}
+
+async function buildOmMaps(payload, key) {
+  const p = payload.property || {};
+  const photos = payload.photos || {};
+  const demo = payload.demographics || null;
+  const addrFull = p.address || [p.address_line1, p.city_state_zip].filter(Boolean).join(', ');
+  // Aerial: only generate a satellite map if the broker did NOT supply an aerial image.
+  const aerialP = httpUrl(photos.aerial_url) ? Promise.resolve(null) : omSatelliteAerial(addrFull, key);
+  // Demographics ring map: parse ring miles from the ring labels ("0.5 Miles" -> 0.5).
+  const ringMiles = demo && Array.isArray(demo.rings)
+    ? demo.rings.map((s) => parseFloat(String(s))).filter((n) => isFinite(n)) : [];
+  const ringP = demo ? omRingMap(addrFull, ringMiles, key) : Promise.resolve(null);
+  const [aerial, demoRing] = await Promise.all([aerialP, ringP]);
+  return { aerial, demoRing };
+}
+
+function omOptionalPages(payload) {
+  const photos = payload.photos || {};
+  const propUrls = (Array.isArray(photos.property_urls) ? photos.property_urls : []).filter((u) => /^https?:\/\//i.test(String(u)));
+  return {
+    photos2: propUrls.length >= 7,                 // page 8 only when 7+ property photos exist
+    siteplan: !!httpUrl(photos.site_plan_url),     // page 9 only when a site plan image is supplied
+    demographics: !!payload.demographics,          // pages 16-17 only when demographics data is supplied
+  };
+}
+
+// Assemble the full OM HTML from a payload. Returns { source, filenameSeed, options }.
+async function assembleOm(payload, broker) {
+  let tpl = loadLocalOmTemplate();
+  if (!tpl) {
+    const r = await fetch(OM_TEMPLATE_URL);
+    if (!r.ok) throw new Error('OM template fetch failed: HTTP ' + r.status);
+    tpl = await r.text();
+  }
+  const maps = await buildOmMaps(payload, process.env.GOOGLE_MAPS_API_KEY);
+  const vars = buildOmVars(payload, broker, maps);
+  let source = fillTemplate(tpl, vars);
+  // patch the two debt-column headers if non-default LTVs were supplied
+  source = source.replace('>60% LTV<', '>' + (vars.DEBT_COL_1 || '60% LTV') + '<')
+                 .replace('>65% LTV<', '>' + (vars.DEBT_COL_2 || '65% LTV') + '<');
+  source = applyOptionalPages(source, omOptionalPages(payload));
+  const p = payload.property || {};
+  // OM is portrait by default (landscape:false) unless the payload overrides options.
+  const options = Object.assign({ landscape: false }, payload.options || {});
+  return { source, filenameSeed: p.name || p.address_line1 || 'offering-memorandum', options };
+}
+
 export default async function handler(req, res) {
   // Deploy marker: GET (or ?version) returns the running version + which template source is live
   // (bundle = read from the function bundle, no cache window; raw-fallback = bundled file unreadable).
@@ -524,6 +885,7 @@ export default async function handler(req, res) {
   const body = req.body || {};
   let source = null;
   let filenameSeed = body.property_address || 'bpo-document';
+  let filePrefix = 'bpo';
   let options = {};
 
   try {
@@ -532,22 +894,32 @@ export default async function handler(req, res) {
       try { payload = JSON.parse(body.payload); }
       catch { return res.status(400).json({ error: 'Invalid payload', detail: 'payload must be a URL-encoded JSON string' }); }
 
-      const broker = BROKERS[payload.broker_id];
-      if (!broker) return res.status(400).json({ error: 'Unknown broker_id', detail: String(payload.broker_id) });
+      const baseBroker = BROKERS[payload.broker_id];
+      if (!baseBroker) return res.status(400).json({ error: 'Unknown broker_id', detail: String(payload.broker_id) });
+      // OM payloads may carry a full broker object (company/website/address/bio); merge it over the registry.
+      const broker = payload.broker ? { ...baseBroker, ...payload.broker } : baseBroker;
 
-      let tpl = loadLocalTemplate();
-      if (!tpl) {  // safety net: bundled file unreadable -> fall back to the raw URL (previous behavior)
-        const tplResp = await fetch(broker.template_url);
-        if (!tplResp.ok) return res.status(502).json({ error: 'Template fetch failed', detail: 'HTTP ' + tplResp.status });
-        tpl = await tplResp.text();
+      if (payload.doc_type === 'om') {
+        const om = await assembleOm(payload, broker);   // portrait, OM template, server-side math
+        source = om.source;
+        filenameSeed = om.filenameSeed;
+        filePrefix = 'om';
+        options = om.options;
+      } else {
+        let tpl = loadLocalTemplate();
+        if (!tpl) {  // safety net: bundled file unreadable -> fall back to the raw URL (previous behavior)
+          const tplResp = await fetch(broker.template_url);
+          if (!tplResp.ok) return res.status(502).json({ error: 'Template fetch failed', detail: 'HTTP ' + tplResp.status });
+          tpl = await tplResp.text();
+        }
+
+        const maps = await buildMaps(payload, process.env.GOOGLE_MAPS_API_KEY); // server-side; null slots keep placeholders
+        const vars = buildVars(payload, broker, maps);
+        source = fillTemplate(tpl, vars);
+        source = applyOptionalPages(source, optionalPages(payload)); // drop unused pages (blank comp page 2, no-city demographics)
+        filenameSeed = (payload.subject && payload.subject.address_line1) || 'bpo-document';
+        options = payload.options || {};
       }
-
-      const maps = await buildMaps(payload, process.env.GOOGLE_MAPS_API_KEY); // server-side; null slots keep placeholders
-      const vars = buildVars(payload, broker, maps);
-      source = fillTemplate(tpl, vars);
-      source = applyOptionalPages(source, optionalPages(payload)); // drop unused pages (blank comp page 2, no-city demographics)
-      filenameSeed = (payload.subject && payload.subject.address_line1) || 'bpo-document';
-      options = payload.options || {};
     } else if (body.html_content !== undefined) {
       source = String(body.html_content);
     } else {
@@ -586,7 +958,7 @@ export default async function handler(req, res) {
 
     const pdfBuffer = await pdfResponse.arrayBuffer();
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(filenameSeed)}.pdf"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(filenameSeed, filePrefix)}.pdf"`);
     res.setHeader('Content-Length', pdfBuffer.byteLength);
     return res.send(Buffer.from(pdfBuffer));
 
@@ -596,8 +968,11 @@ export default async function handler(req, res) {
   }
 }
 
-function sanitizeFilename(address) {
-  if (!address) return 'bpo-document';
-  return 'bpo-' + address.toLowerCase()
+function sanitizeFilename(address, prefix = 'bpo') {
+  if (!address) return prefix + '-document';
+  return prefix + '-' + address.toLowerCase()
     .replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').substring(0, 60);
 }
+
+// Named exports for local testing (the default export remains the Vercel handler).
+export { assembleOm, buildOmVars, fillTemplate };
