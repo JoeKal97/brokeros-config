@@ -27,7 +27,7 @@
 //
 // CONFIG (Vercel env, server-side only, never logged):
 //   TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY,
-//   BROKEROS_AGENT_ID (optional override of the persisted agent id).
+//   BROKEROS_AGENT_ID (REQUIRED — the Managed Agent id; no fallback, the bot refuses to run without it).
 
 // NOTE: @anthropic-ai/sdk is heavy; it is lazy-loaded (dynamic import) inside the agent-call
 // path only, so it stays OUT of cold-start module init — the webhook 200 + ack fire first.
@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-17-tg-22-batchux';
+const VERSION = '2026-06-17-tg-23-agentreq';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -75,7 +75,14 @@ function deliveredDecision(row, text) {
 }
 
 // Rebuilt agent governed by base workflow + agents/telegram-delivery-contract.md.
-const AGENT_ID = process.env.BROKEROS_AGENT_ID || 'agent_0158kmQA7nKFSB6xRdTSfJ2C';
+// REQUIRED — no hardcoded fallback: running on a silently-stale agent (missing comp-confirmation /
+// multi-photo / reconciliation) is worse than failing loudly. Anything that needs the agent calls
+// requireAgentId(), which throws a clear, actionable error if BROKEROS_AGENT_ID is unset.
+const AGENT_ID = process.env.BROKEROS_AGENT_ID;
+function requireAgentId() {
+  if (!AGENT_ID) throw new Error('BROKEROS_AGENT_ID is not set — configure it (the Managed Agent id, e.g. agent_…) in the Vercel environment. Refusing to fall back to a stale agent.');
+  return AGENT_ID;
+}
 const GENERATE_PDF_URL = 'https://brokeros-config.vercel.app/api/generate-pdf';
 const PARSE_RENTROLL_URL = 'https://brokeros-config.vercel.app/api/parse-rentroll';
 const PARSE_COMP_URL = 'https://brokeros-config.vercel.app/api/parse-comp-pdf';
@@ -498,10 +505,11 @@ async function ensureEnv() {
   return cachedEnvId;
 }
 async function newSession() {
+  const agent = requireAgentId();           // fail loudly if BROKEROS_AGENT_ID is unset (no silent fallback)
   const anthropic = await getAnthropic();
   let envId;
-  try { envId = await ensureEnv(); return { ...(await anthropic.beta.sessions.create({ agent: AGENT_ID, environment_id: envId })), envId }; }
-  catch (e) { cachedEnvId = null; envId = await ensureEnv(); return { ...(await anthropic.beta.sessions.create({ agent: AGENT_ID, environment_id: envId })), envId }; }
+  try { envId = await ensureEnv(); return { ...(await anthropic.beta.sessions.create({ agent, environment_id: envId })), envId }; }
+  catch (e) { cachedEnvId = null; envId = await ensureEnv(); return { ...(await anthropic.beta.sessions.create({ agent, environment_id: envId })), envId }; }
 }
 async function collectEvents(sessionId) {
   const anthropic = await getAnthropic();
@@ -1051,13 +1059,15 @@ export default async function handler(req, res) {
   // Diagnostic: which agent does PROD actually resolve, and is it live? (agent_id/name are
   // not secrets.) Proves env-override vs bundled-default and that it isn't the archived agent.
   if (req.method === 'GET' && req.query && req.query.selftest === 'agent') {
-    const out = { selftest: 'agent', agent_id: AGENT_ID, source: process.env.BROKEROS_AGENT_ID ? 'env:BROKEROS_AGENT_ID' : 'bundled-default' };
+    if (!AGENT_ID) return res.status(200).json({ selftest: 'agent', ok: false, error: 'BROKEROS_AGENT_ID is not set in the environment — set it (the Managed Agent id) before the bot can create agent sessions.' });
+    const out = { selftest: 'agent', ok: true, agent_id: AGENT_ID, source: 'env:BROKEROS_AGENT_ID' };
     try {
       const anthropic = await getAnthropic();
       const a = await anthropic.beta.agents.retrieve(AGENT_ID);
       out.name = a.name;
       out.archived = !!a.archived_at;
     } catch (e) {
+      out.ok = false;
       out.retrieve_error = String((e && e.message) || e);
     }
     return res.status(200).json(out);
