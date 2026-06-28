@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-17-tg-20-batch';
+const VERSION = '2026-06-17-tg-21-voicecmd';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -68,7 +68,7 @@ function deliveredAgeMs(row) {
 //   'closed'   -> correction to a delivered BPO past the window -> honest "session closed"
 //   'continue' -> edit a non-expired delivered BPO, or a normal in-progress turn
 function deliveredDecision(row, text) {
-  const wantStart = START_RE.test(text) || NEWBPO_RE.test(text);
+  const wantStart = isFreshStart(text);
   if (wantStart) return 'new';
   if (row && row.status === 'delivered' && deliveredAgeMs(row) > DELIVERED_TTL_MS) return 'closed';
   return 'continue';
@@ -84,8 +84,16 @@ const TERMINAL = new Set(['session.status_idle', 'session.status_terminated', 's
 const TG_API = (token, m) => `https://api.telegram.org/bot${token}/${m}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const START_RE = /^\s*\/?(start|new|bpo)\b/i;       // "/start", "/new", "new bpo", "start a bpo", bare "BPO"
-const NEWBPO_RE = /\bnew\s*bpo\b/i;
+// Fresh-start ("new BPO") detection — robust to SPOKEN/transcribed variants, because the voice path
+// runs the transcript through this SAME recognition. BARE_START_RE = an explicit typed command on its
+// own ("/start", "/new", bare "BPO"/"new"). NEWBPO_RE = natural phrasings: it requires a fresh-intent
+// word PLUS a BPO-ish object (bpo / b.p.o. / one / report / valuation / opinion) — or "start a bpo" /
+// "start over/fresh" — so it NEVER trips on data like "new construction", "new listing", or "start
+// with the address". normCmd folds spoken "B. P. O." -> "bpo" first so dotted/spaced forms match.
+const BARE_START_RE = /^\s*\/?(?:start|new|bpo)\s*$/i;
+const NEWBPO_RE = /\b(?:new|fresh|another)\s+(?:bpo|one|report|valuation|broker'?s?\s+(?:price\s+)?opinion)\b|\b(?:start|begin|create|make|do)\s+(?:an?\s+)?(?:new\s+|fresh\s+|another\s+)?(?:bpo|broker'?s?\s+(?:price\s+)?opinion)\b|\bstart\s+(?:over|fresh|anew)\b/i;
+const normCmd = (s) => String(s || '').replace(/\bb\.?\s*p\.?\s*o\.?\b/gi, 'bpo');
+const isFreshStart = (text) => { const t = normCmd(text); return BARE_START_RE.test(t) || NEWBPO_RE.test(t); };
 const END_RE = /^\s*\/?(cancel|done|reset|stop)\b/i;
 const RETRY_RE = /^\s*\/?(retry|resend|try\s*again|again|yes|yep|yeah|yup|ok(ay)?|sure|go|please)\b/i; // after a failed generation
 
@@ -537,6 +545,80 @@ async function parseRentRoll(bytes) {
   return { ok: false, detail: (j && (j.detail || j.error)) || ('HTTP ' + r.status) };
 }
 
+// ---- SHARED COMMAND-AWARE TURN ----
+// The bridge's command recognition (fresh-start "new BPO" vs reuse, generate-ack, retry, expiry, the
+// agent turn + reply handling) for ONE inbound message. Called by BOTH the typed-text path and the
+// VOICE path (with the transcript) so a voiced command is handled IDENTICALLY to the same words typed.
+// Caller holds the per-chat turn lock and has sent any instant ack; the caller releases the lock.
+// ctx = { row, lockTaken, buildAcked, genIntent, wantStart, tm }. For a brand-new chat the lock can
+// only be taken AFTER the session row exists, so this acquires it then and flips ctx.lockTaken (an
+// object field) so the CALLER's finally still releases it.
+async function runTurn(token, chatId, incoming, ctx) {
+  let row = ctx.row;
+  let buildAcked = ctx.buildAcked || false;
+  const { genIntent, wantStart } = ctx;
+
+  // Generate-intent: lock is held and we will run the turn -> acknowledge the BUILD immediately.
+  if (genIntent && !buildAcked) { await sendMessage(token, chatId, 'Got it — building your BPO now ⏳'); buildAcked = true; }
+
+  // RETRY after a failed generation: re-run the stashed payload directly. Any other message clears
+  // the failed state and routes to the agent normally (so the broker can correct data instead).
+  if (row && row.status === 'generate_failed' && row.last_payload) {
+    if (RETRY_RE.test(incoming)) { await runGeneration(token, chatId, row.last_payload, { ackedBuilding: buildAcked }); return; }
+    await sbClearState(chatId);
+    row = { ...row, status: null };
+  }
+
+  // EXPIRY: a non-start message poking a long-closed delivered BPO -> close it and ask.
+  if (deliveredDecision(row, incoming) === 'closed') {
+    await sbDelete(chatId);
+    await sendMessage(token, chatId, "That BPO session has closed — want me to start a new one? Send \"new BPO\" and we’ll begin.");
+    return;
+  }
+
+  // A non-"new BPO" message while a delivered BPO is on file = a post-delivery correction: reuse the
+  // SAME session (still holds the built payload) so the agent edits it.
+  const editingDelivered = !wantStart && row && row.status === 'delivered' && row.session_id;
+
+  let sessionId;
+  if (wantStart || !row) {              // START: fresh session, wiped clean
+    const s = await newSession();
+    sessionId = s.id;
+    await sbUpsert(chatId, sessionId, s.envId);
+    await sbClearState(chatId);
+    if (!ctx.lockTaken) { await sbAcquireLock(chatId); ctx.lockTaken = true; } // lock the fresh turn (row now exists)
+  } else {                              // REUSE: same stateful session = memory
+    sessionId = row.session_id;
+  }
+
+  // Bare start command ("/start", "/new", "BPO") -> kick the agent's intake; otherwise pass through.
+  const toSend = BARE_START_RE.test(normCmd(incoming)) ? 'Hi, I need to start a new BPO.' : incoming;
+
+  const deadline = Date.now() + 200000;
+  let reply;
+  try {
+    reply = await sendTurn(sessionId, toSend, deadline);
+  } catch (e) {
+    if (editingDelivered) {
+      await sendMessage(token, chatId, "That BPO’s session has expired, so I can’t edit it in place anymore. Send “new BPO” and I’ll rebuild it.");
+      return;
+    }
+    const s = await newSession();
+    sessionId = s.id;
+    await sbUpsert(chatId, sessionId, s.envId);
+    reply = await sendTurn(sessionId, toSend, deadline);
+  }
+
+  if (ctx.tm) mark(ctx.tm, 'agentReply');
+  if (!reply) { await sendMessage(token, chatId, "Sorry — I couldn't get a reply in time. Please try again."); return; }
+
+  const payload = extractGenerate(reply);
+  if (payload) { await runGeneration(token, chatId, payload, { ackedBuilding: buildAcked }); return; }
+
+  await sbTouch(chatId);
+  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
+}
+
 // An xlsx arrived: download -> parse -> inject parsed tenants into the chat's session so the
 // agent goes straight to the per-suite confirmation (broker never types an uploaded rent roll).
 async function handleXlsx(token, chatId, doc) {
@@ -733,27 +815,16 @@ async function handleVoice(token, chatId, voice) {
     }
     recordUpload(chatId, { name: 'your voice memo', kind: 'voice', supported: true, readable: 'voice notes' });
 
-    // Feed the transcript to the agent AS IF the broker typed it — same session continuation a text
-    // turn uses. Mis-transcriptions (esp. numbers) surface at the agent's confirmation step, not here.
-    let row = await sbGet(chatId);
-    let sessionId;
-    if (!row) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
-    else sessionId = row.session_id;
-
-    const deadline = Date.now() + 200000;
-    let reply;
-    try { reply = await sendTurn(sessionId, tr.text, deadline); }
-    catch (e) {
-      const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId);
-      reply = await sendTurn(sessionId, tr.text, deadline);
-    }
-    mark(_tm, 'agentReply');
-    if (!reply) { await sendMessage(token, chatId, "Got your voice memo but couldn’t get a reply in time — try again."); return; }
-
-    const payload = extractGenerate(reply);
-    if (payload) { await runGeneration(token, chatId, payload); return; }
-    await sbTouch(chatId);
-    await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
+    // Treat the transcript EXACTLY like the same words typed: run it through the SAME command
+    // recognition the text path uses (fresh-start "new BPO", generate, retry, corrections), and only
+    // fall through to data intake if it isn't a command. The voice memo already acked ("listening…")
+    // and holds the turn lock (fileGateAcquire), so runTurn won't re-ack-as-data or re-acquire.
+    const incoming = tr.text;
+    if (END_RE.test(incoming)) { await sbDelete(chatId); await sendMessage(token, chatId, "Session ended. Send 'new BPO' to start again."); return; }
+    const wantStart = isFreshStart(incoming);
+    const genIntent = GENERATE_INTENT_RE.test(incoming);
+    const row = await sbGet(chatId);
+    await runTurn(token, chatId, incoming, { row, lockTaken, buildAcked: false, genIntent, wantStart, tm: _tm });
   } catch (e) {
     console.error('handleVoice error:', (e && e.message) || e);
     try { await sendMessage(token, chatId, "Hit an error with that voice memo — try again or type it."); } catch { /* ignore */ }
@@ -906,6 +977,19 @@ export default async function handler(req, res) {
       try { await sbDelete(sentinel); } catch { /* ignore */ }
       return res.status(200).json({ selftest: 'batch', ok: false, error: String((e && e.message) || e) });
     }
+  }
+  // Voice-command recognition proof (no phone): runs the SAME isFreshStart / GENERATE_INTENT_RE the
+  // voice transcript flows through against spoken/typed variants + data decoys. ok=true means every
+  // "new BPO" spoken form is caught, every generate form is caught, and NO data string is misread.
+  if (req.method === 'GET' && req.query && req.query.selftest === 'voicecmd') {
+    const START = ['new BPO', 'new bpo', 'a new BPO', 'start a new BPO', 'new B.P.O.', 'new B. P. O.', 'start a new one', "let's start a new one", 'start over', 'start fresh', 'begin a new BPO', 'create a new one', 'another BPO', 'do a new valuation', 'okay, can we start a new BPO please', '/new', 'BPO', 'start a bpo'];
+    const GEN = ['generate the BPO', 'build it', 'make the bpo', 'go for it', 'generate', 'build the report', 'run it', "let's go"];
+    const DATA = ['the property is new construction', 'new listing on Higgins', 'start with the address 123 Main St', 'the new owner took over in 2020', 'new roof installed last year', 'I have one more comp coming', 'the asking price is 1.6 million', 'starting the financials at 96k NOI', 'do a new comp photo', 'make it a corner unit'];
+    const startMiss = START.filter((s) => !isFreshStart(s));
+    const genMiss = GEN.filter((s) => !GENERATE_INTENT_RE.test(s));
+    const dataFalse = DATA.filter((s) => isFreshStart(s) || GENERATE_INTENT_RE.test(s));
+    const ok = !startMiss.length && !genMiss.length && !dataFalse.length;
+    return res.status(200).json({ selftest: 'voicecmd', ok, startMissed: startMiss, generateMissed: genMiss, dataFalsePositives: dataFalse });
   }
   // Concurrency proof for the per-chat TURN LOCK: fire N concurrent atomic acquires against a
   // sentinel row; exactly ONE must win (this is what closes the agent-deciding window). Then prove
@@ -1063,7 +1147,7 @@ export default async function handler(req, res) {
         mark(_tm, 'ackSent');
       }
 
-      const wantStart = START_RE.test(incoming) || NEWBPO_RE.test(incoming);
+      const wantStart = isFreshStart(incoming);
       let row = await sbGet(chatId);
       mark(_tm, 'sbGet');
 
@@ -1099,86 +1183,14 @@ export default async function handler(req, res) {
         if (!(await sbAcquireLock(chatId))) { await sendMessage(token, chatId, busyLine(row)); return; }
         lockTaken = true;
       }
+      // Hand off to the SHARED command-aware turn (identical path the voice transcript runs through).
+      // ctx.lockTaken is flipped inside runTurn if it locks a brand-new chat, so the finally releases it.
+      const ctx = { row, lockTaken, buildAcked, genIntent, wantStart, tm: _tm };
       try {
-      // Generate-intent: we now hold the turn lock and will run the turn -> acknowledge the BUILD
-      // immediately rather than leaving the broker on the generic line while the agent decides.
-      if (genIntent) { await sendMessage(token, chatId, 'Got it — building your BPO now ⏳'); buildAcked = true; }
-      // RETRY after a failed generation: re-run the stashed payload directly (no agent round
-      // trip, no reliance on the agent re-emitting). Any other message clears the failed state
-      // and routes to the agent normally (so the broker can also correct data instead).
-      if (row && row.status === 'generate_failed' && row.last_payload) {
-        if (RETRY_RE.test(incoming)) {
-          await runGeneration(token, chatId, row.last_payload, { ackedBuilding: buildAcked }); // typing already pulsing
-          return;
-        }
-        await sbClearState(chatId); // not a retry -> fall through to a normal agent turn
-        row = { ...row, status: null };
-      }
-
-      // EXPIRY: a delivered BPO stays correctable only for DELIVERED_TTL. A non-start message
-      // after that window is poking a long-closed BPO — close it and ask, rather than resurfacing
-      // stale state. (Bare "BPO" / "new BPO" / "start a BPO" are 'new' and skip this.)
-      if (deliveredDecision(row, incoming) === 'closed') {
-        await sbDelete(chatId);
-        await sendMessage(token, chatId, "That BPO session has closed — want me to start a new one? Send \"new BPO\" and we’ll begin.");
-        return;
-      }
-
-      // Normal agent turn — typing is already pulsing and the ack was already sent above.
-      try {
-        // A non-"new BPO" message while a delivered BPO is on file = a post-delivery correction:
-        // reuse the SAME session (which still holds the built payload) so the agent edits it.
-        const editingDelivered = !wantStart && row && row.status === 'delivered' && row.session_id;
-
-        let sessionId;
-        if (wantStart || !row) {            // START: fresh session, wiped clean
-          const s = await newSession();
-          sessionId = s.id;
-          await sbUpsert(chatId, sessionId, s.envId);
-          await sbClearState(chatId);       // drop any prior delivered/generating/failed state
-          if (!lockTaken) { await sbAcquireLock(chatId); lockTaken = true; } // lock this fresh turn (row now exists)
-        } else {                            // REUSE: same stateful session = memory
-          sessionId = row.session_id;
-        }
-
-        // Bare start command ("/start", "/new", "BPO") -> kick the agent's intake; otherwise pass through.
-        const toSend = /^\s*\/?(start|new|bpo)\s*$/i.test(incoming) ? 'Hi, I need to start a new BPO.' : incoming;
-
-        const deadline = Date.now() + 200000; // generous; returns as soon as the agent is idle
-        let reply;
-        try {
-          reply = await sendTurn(sessionId, toSend, deadline);
-        } catch (e) {
-          // The stored session/env was reclaimed. For a post-delivery edit the context is gone,
-          // so recreating blank would lose the BPO — tell the broker to restart instead.
-          if (editingDelivered) {
-            await sendMessage(token, chatId, "That BPO’s session has expired, so I can’t edit it in place anymore. Send “new BPO” and I’ll rebuild it.");
-            return;
-          }
-          const s = await newSession();
-          sessionId = s.id;
-          await sbUpsert(chatId, sessionId, s.envId);
-          reply = await sendTurn(sessionId, toSend, deadline);
-        }
-
-        mark(_tm, 'agentReply'); // agent produced its reply
-        if (!reply) { await sendMessage(token, chatId, "Sorry — I couldn't get a reply in time. Please try again."); return; }
-
-        // Generation signal? Hand the payload to the bridge — it owns building/sent/failed.
-        const payload = extractGenerate(reply);
-        if (payload) {
-          await runGeneration(token, chatId, payload, { ackedBuilding: buildAcked });
-          return;
-        }
-
-        // Normal conversational turn. (Strip any stray GENERATE_BPO marker just in case.)
-        await sbTouch(chatId);
-        await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_BPO\s*/i, '').trim() || reply);
+        await runTurn(token, chatId, incoming, ctx);
       } finally {
         stopTyping();
-      }
-      } finally {
-        if (lockTaken) await sbReleaseLock(chatId); // release the per-chat turn lock (success, conversational, or error)
+        if (ctx.lockTaken) await sbReleaseLock(chatId); // release the per-chat turn lock (success, conversational, or error)
       }
     } catch (e) {
       try { await sendMessage(token, chatId, '⚠️ Something went wrong — please try again.'); } catch { /* ignore */ }
