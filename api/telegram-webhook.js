@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-17-tg-21-voicecmd';
+const VERSION = '2026-06-17-tg-22-batchux';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -365,17 +365,26 @@ async function fileGateAcquire(token, chatId, instantAck) {
   return false;
 }
 
-// ---- BATCH SETTLE / DEBOUNCE (one consolidated confirmation per batch) ----
-// When a broker forwards N comps (or N photos) at once, each arrives as its own webhook. Without
-// debounce the agent emits a separate, growing confirmation after EVERY file ("comp 1?" → "comps 1-2?"
-// → "comps 1-2-3?"), which reads like files were lost. Instead each file APPENDS its parsed item to a
-// per-chat buffer (cross-instance, in Supabase) under the turn lock (so appends can't clobber), then
-// the LAST file to land (none newer for BATCH_SETTLE_MS) drains the buffer and emits ONE consolidated
-// confirmation. Buffer = `pending_batch jsonb`, shaped { comp:{items,token}, photo:{items,token} } so
-// the two kinds never clobber each other. Each append stamps a fresh token; the settler is whoever's
-// token is still latest after the wait. REQUIRES `pending_batch jsonb` (ALTER TABLE) — if absent, the
-// write 400s and we fall back to the previous per-file inject+confirm (so it's safe to ship pre-migration).
-const BATCH_SETTLE_MS = 2500;
+// ---- BATCH SETTLE / DEBOUNCE (one consolidated response per multi-file batch) ----
+// When a broker forwards N comps (or N photos) at once, each arrives as its own webhook. The journey
+// must read as: ONE upfront "I see multiple files, stand by" → SILENCE while processing (no per-file
+// acks) → ONE consolidated result (comps confirmation / "Got your N photos"). Mechanism:
+//   • Files SERIALIZE on the per-chat turn lock (batchGate): the first ("leader") processes; the rest
+//     QUEUE silently and mark the batch multi-file.
+//   • Each file APPENDS its parsed item to a per-chat buffer (`pending_batch jsonb`, shaped
+//     { comp:{items,queued}, photo:{items,queued} }) UNDER the lock, so appends can't clobber.
+//   • SETTLE BY LOCK-REACQUIRE: after a file finishes + releases, it waits BATCH_SETTLE_MS then tries
+//     to re-acquire. If it succeeds, the lock is free => no other file is processing/queued => it's the
+//     LAST one => it drains the buffer and emits the one consolidated result. If it fails, another file
+//     is still working and will settle. This is robust to SLOW files (comps parse ~8s) — unlike a fixed
+//     "no newer append for N seconds" window, which let slow comps each settle alone (the growing re-ask).
+// REQUIRES `pending_batch jsonb` (ALTER TABLE); if absent, batchAppend 400s and the caller falls back
+// to the previous per-file inject+confirm (safe pre-migration).
+const ANNOUNCE_MS = 1200;       // leader holds briefly to learn if this is a multi-file batch before acking
+const BATCH_SETTLE_MS = 2500;   // quiet window after a file finishes; if the lock is then free, it's the last
+const BATCH_POLL_MS = 700;      // queued files poll for the lock this often — MUST be < BATCH_SETTLE_MS
+const BATCH_ANNOUNCE = 'Got it — I see multiple files. I’ll work through them one at a time, stand by…';
+
 // PATCH the buffer; returns true on success, false if the column doesn't exist (-> fallback path).
 async function sbWriteBatch(chatId, pendingBatch) {
   let r;
@@ -387,36 +396,76 @@ async function sbWriteBatch(chatId, pendingBatch) {
   } catch { return false; }
   return r.ok;
 }
-// Append one parsed item to the buffer for `kind`. Caller MUST hold the turn lock (serializes the
-// read-modify-write). Returns { myToken } on success or { fallback:true } if the column is missing.
-async function batchAppend(chatId, kind, item) {
-  const myToken = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  const row = await sbGet(chatId);
+function batchSlice(row, kind) {
   const pb = (row && row.pending_batch && typeof row.pending_batch === 'object') ? row.pending_batch : {};
   const cur = (pb[kind] && Array.isArray(pb[kind].items)) ? pb[kind] : { items: [] };
-  cur.items.push(item);
-  cur.token = myToken;
-  pb[kind] = cur;
-  return (await sbWriteBatch(chatId, pb)) ? { myToken } : { fallback: true };
+  return { pb, cur };
 }
-// Wait the settle window, then claim the batch IFF no newer file landed (our token still latest).
-// Returns the drained items array if THIS call is the settler, else null (a later file will settle).
-async function batchSettle(chatId, kind, myToken) {
-  await sleep(BATCH_SETTLE_MS);
+// A queued file marks the batch (for kind) multi-file so the leader announces it. Idempotent; keeps items.
+async function batchMarkQueued(chatId, kind) {
+  const { pb, cur } = batchSlice(await sbGet(chatId), kind);
+  cur.queued = true; pb[kind] = cur;
+  await sbWriteBatch(chatId, pb);
+}
+async function batchIsQueued(chatId, kind) {
   const row = await sbGet(chatId);
-  const pb = (row && row.pending_batch && typeof row.pending_batch === 'object') ? row.pending_batch : null;
-  if (!pb || !pb[kind] || pb[kind].token !== myToken) return null; // superseded -> a later file settles
-  const items = Array.isArray(pb[kind].items) ? pb[kind].items : [];
+  return !!(row && row.pending_batch && row.pending_batch[kind] && row.pending_batch[kind].queued);
+}
+// Append one parsed item under the held lock (atomic). Returns { ok } or { fallback:true } (no column).
+async function batchAppend(chatId, kind, item) {
+  const { pb, cur } = batchSlice(await sbGet(chatId), kind);
+  cur.items.push(item); pb[kind] = cur;
+  return (await sbWriteBatch(chatId, pb)) ? { ok: true } : { fallback: true };
+}
+// Settler reads + clears this kind's items (keeps the other kind). Caller holds the lock.
+async function drainBatch(chatId, kind) {
+  const row = await sbGet(chatId);
+  const pb = (row && row.pending_batch && typeof row.pending_batch === 'object') ? row.pending_batch : {};
+  const items = (pb[kind] && Array.isArray(pb[kind].items)) ? pb[kind].items : [];
   delete pb[kind];
-  await sbWriteBatch(chatId, Object.keys(pb).length ? pb : null); // clear our slice; keep the other kind
+  await sbWriteBatch(chatId, Object.keys(pb).length ? pb : null);
   return items;
 }
-// Re-take the turn lock for the settler's single consolidated turn (no ack; the file acks already fired).
-async function lockWait(chatId, maxMs = FILE_QUEUE_WAIT_MS) {
-  if (await sbAcquireLock(chatId)) return true;
-  const deadline = Date.now() + maxMs;
-  while (Date.now() < deadline) { await sleep(2000); if (await sbAcquireLock(chatId)) return true; }
-  return false;
+// File-batch gate: take the turn lock SILENTLY (no per-file ack). The leader (got the lock now) returns
+// waited:false; a queued file marks the batch multi-file, waits for the lock, returns waited:true.
+async function batchGate(token, chatId, kind) {
+  const row = await sbGet(chatId);
+  if (!row) { try { const s = await newSession(); await sbUpsert(chatId, s.id, s.envId); } catch { /* ignore */ } }
+  if (await sbAcquireLock(chatId)) return { ok: true, waited: false }; // leader
+  await batchMarkQueued(chatId, kind);                                 // tell the leader this is a batch
+  const deadline = Date.now() + FILE_QUEUE_WAIT_MS;
+  while (Date.now() < deadline) { await sleep(BATCH_POLL_MS); if (await sbAcquireLock(chatId)) return { ok: true, waited: true }; }
+  await sendMessage(token, chatId, 'Still tied up finishing the last one — send that file again in a moment and I’ll grab it.');
+  return { ok: false, waited: true };
+}
+// Run the standard batch lifecycle for one file: silent gate -> leader announces batch-or-single ->
+// fn() does the file work + returns the parsed item (or null to abort) -> append -> settle-by-reacquire
+// -> the LAST file calls inject(items) with the whole batch. `singleAck` is sent by a solo leader only.
+// `inject(items)` and the fallback path run while THIS call holds the lock. Returns nothing.
+async function runFileBatch(token, chatId, kind, { singleAck, fn, inject }) {
+  let lockTaken = false;
+  try {
+    const gate = await batchGate(token, chatId, kind);
+    if (!gate.ok) return;
+    lockTaken = true;
+    if (!gate.waited) {                       // leader: after a short look, announce a batch, else a solo ack
+      await sleep(ANNOUNCE_MS);
+      await sendMessage(token, chatId, (await batchIsQueued(chatId, kind)) ? BATCH_ANNOUNCE : singleAck);
+    }
+    const item = await fn();                  // download/parse/upload; may message + return null on failure
+    if (item == null) return;
+    const appended = await batchAppend(chatId, kind, item);
+    if (appended.fallback) { await inject([item]); return; }   // no column -> per-file (held lock)
+    await sbReleaseLock(chatId); lockTaken = false;            // hand off to the next queued file
+    await sleep(BATCH_SETTLE_MS);
+    if (!(await sbAcquireLock(chatId))) return;               // another file still working -> it settles
+    lockTaken = true;
+    const items = await drainBatch(chatId, kind);
+    if (!items.length) return;                                // already drained by another settler
+    await inject(items);                                      // ONE consolidated result for the whole batch
+  } finally {
+    if (lockTaken) await sbReleaseLock(chatId);
+  }
 }
 
 // Answer a STATUS check-in with the real state — never a generic ack. (Mid-generation is
@@ -719,50 +768,39 @@ async function injectCompsAndReply(token, chatId, comps) {
 // comp data + photo_url into the payload (same pattern as xlsx/subject photo).
 async function handleCompPdf(token, chatId, doc) {
   const stop = startTyping(token, chatId);
-  let lockTaken = false;
   try {
-    // Queue behind any in-flight turn (don't reject) so a batch of comp PDFs all accumulate.
-    lockTaken = await fileGateAcquire(token, chatId, `Reading ${doc.file_name || 'that comp PDF'}…`);
-    if (!lockTaken) return;
-    const meta = await tgGetFile(token, doc.file_id);
-    const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
-    if (!bytes) {
-      recordUpload(chatId, { name: doc.file_name || 'that PDF', kind: 'document', supported: false, readable: 'that file' });
-      await sendMessage(token, chatId, `Got ${doc.file_name || 'your PDF'}, but couldn’t download it from Telegram. Send it again.`);
-      return;
-    }
-    const parsed = await parseCompPdf(bytes);
-    if (!parsed.ok || !parsed.comp) {
-      console.error('parse-comp-pdf failed:', parsed.detail);
-      recordUpload(chatId, { name: doc.file_name || 'that PDF', kind: 'document', supported: false, readable: 'that PDF' });
-      await sendMessage(token, chatId, `Got ${doc.file_name || 'your PDF'}, but I couldn’t read a comp from it${parsed.detail ? ` (${parsed.detail})` : ''}. You can type the comp details instead.`);
-      return;
-    }
-
-    // Upload the extracted photo (if any) -> public URL. Bridge owns file work; agent gets a URL.
-    let photo_url = null;
-    if (parsed.photo_base64) {
-      try { photo_url = await uploadPhoto(Buffer.from(parsed.photo_base64, 'base64'), `${chatId}/comp_${Date.now()}.png`, 'png'); }
-      catch (e) { console.error('comp photo upload error:', (e && e.message) || e); }
-    }
-    const comp = { ...parsed.comp, photo_url };
-    recordUpload(chatId, { name: doc.file_name || 'that comp PDF', kind: 'comp_pdf', supported: true, readable: 'MLS comp PDF' });
-
-    // Debounce a BATCH of comps into ONE confirmation: append under the held lock (atomic), release so
-    // the rest of the batch can land, then only the settler (no newer comp for BATCH_SETTLE_MS) emits.
-    const appended = await batchAppend(chatId, 'comp', comp);
-    if (appended.fallback) { await injectCompsAndReply(token, chatId, [comp]); return; } // no column -> per-file
-    await sbReleaseLock(chatId); lockTaken = false;          // let the rest of the batch append
-    const items = await batchSettle(chatId, 'comp', appended.myToken);
-    if (!items) return;                                       // a later comp will emit the consolidated confirmation
-    if (!(await lockWait(chatId))) return;                    // re-take the lock for the single consolidated turn
-    lockTaken = true;
-    await injectCompsAndReply(token, chatId, items);
+    await runFileBatch(token, chatId, 'comp', {
+      singleAck: `Reading ${doc.file_name || 'that comp PDF'}…`,
+      // Download -> parse-comp-pdf -> upload photo. Returns the parsed comp, or null (after messaging) on failure.
+      fn: async () => {
+        const meta = await tgGetFile(token, doc.file_id);
+        const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
+        if (!bytes) {
+          recordUpload(chatId, { name: doc.file_name || 'that PDF', kind: 'document', supported: false, readable: 'that file' });
+          await sendMessage(token, chatId, `Got ${doc.file_name || 'your PDF'}, but couldn’t download it from Telegram. Send it again.`);
+          return null;
+        }
+        const parsed = await parseCompPdf(bytes);
+        if (!parsed.ok || !parsed.comp) {
+          console.error('parse-comp-pdf failed:', parsed.detail);
+          recordUpload(chatId, { name: doc.file_name || 'that PDF', kind: 'document', supported: false, readable: 'that PDF' });
+          await sendMessage(token, chatId, `Got ${doc.file_name || 'your PDF'}, but I couldn’t read a comp from it${parsed.detail ? ` (${parsed.detail})` : ''}. You can type the comp details instead.`);
+          return null;
+        }
+        let photo_url = null; // bridge owns file work; agent only gets a URL
+        if (parsed.photo_base64) {
+          try { photo_url = await uploadPhoto(Buffer.from(parsed.photo_base64, 'base64'), `${chatId}/comp_${Date.now()}.png`, 'png'); }
+          catch (e) { console.error('comp photo upload error:', (e && e.message) || e); }
+        }
+        recordUpload(chatId, { name: doc.file_name || 'that comp PDF', kind: 'comp_pdf', supported: true, readable: 'MLS comp PDF' });
+        return { ...parsed.comp, photo_url };
+      },
+      inject: (comps) => injectCompsAndReply(token, chatId, comps),
+    });
   } catch (e) {
     console.error('handleCompPdf error:', (e && e.message) || e);
     try { await sendMessage(token, chatId, `Got ${doc.file_name || 'your PDF'}, but hit an error reading it. You can type the comp details instead.`); } catch { /* ignore */ }
   } finally {
-    if (lockTaken) await sbReleaseLock(chatId);
     stop();
   }
 }
@@ -892,47 +930,30 @@ async function injectPhotosAndReply(token, chatId, urls) {
 async function handlePhoto(token, chatId, photos) {
   const _tm = newTiming('photo', chatId);
   const stop = startTyping(token, chatId);
-  let lockTaken = false;
   try {
-    // Queue behind any in-flight turn (don't reject) so batched photos all process + distribute.
-    lockTaken = await fileGateAcquire(token, chatId, 'Got it — saving your photo…');
-    if (!lockTaken) return;
-    mark(_tm, 'ackSent');
-
-    const best = Array.isArray(photos) && photos.length ? photos[photos.length - 1] : null; // largest size
-    const meta = best ? await tgGetFile(token, best.file_id) : null;
-    const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
-    mark(_tm, 'downloaded');
-    if (!bytes) {
-      await sendMessage(token, chatId, "Couldn’t grab that image from Telegram — send it again.");
-      return;
-    }
-    const ext = ((meta.file_path.match(/\.([A-Za-z0-9]+)$/) || [])[1] || 'jpg').toLowerCase();
-    const url = await uploadPhoto(bytes, `${chatId}/${Date.now()}.${ext}`, ext);
-    mark(_tm, 'uploaded');
-    if (!url) {
-      await sendMessage(token, chatId, "Couldn’t save that image — try again.");
-      return;
-    }
-    recordUpload(chatId, { name: 'the property photo', kind: 'photo', supported: true, readable: 'images' });
-    mark(_tm, 'photoConfirm');
-
-    // Debounce a BATCH of photos into ONE "got your N photos": append under the held lock, release so
-    // the rest of the batch lands, then only the settler injects all URLs + sends one count message.
-    const appended = await batchAppend(chatId, 'photo', url);
-    if (appended.fallback) { await injectPhotosAndReply(token, chatId, [url]); mark(_tm, 'agentReply'); return; } // no column -> per-file
-    await sbReleaseLock(chatId); lockTaken = false;          // let the rest of the batch append
-    const urls = await batchSettle(chatId, 'photo', appended.myToken);
-    if (!urls) return;                                       // a later photo will emit the consolidated ack
-    if (!(await lockWait(chatId))) return;                    // re-take the lock for the single consolidated turn
-    lockTaken = true;
-    await injectPhotosAndReply(token, chatId, urls);
+    await runFileBatch(token, chatId, 'photo', {
+      singleAck: 'Got it — saving your photo…',
+      // Grab the largest size -> upload to the bucket. Returns the public URL, or null (after messaging).
+      fn: async () => {
+        const best = Array.isArray(photos) && photos.length ? photos[photos.length - 1] : null; // largest size
+        const meta = best ? await tgGetFile(token, best.file_id) : null;
+        const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
+        mark(_tm, 'downloaded');
+        if (!bytes) { await sendMessage(token, chatId, "Couldn’t grab that image from Telegram — send it again."); return null; }
+        const ext = ((meta.file_path.match(/\.([A-Za-z0-9]+)$/) || [])[1] || 'jpg').toLowerCase();
+        const url = await uploadPhoto(bytes, `${chatId}/${Date.now()}.${ext}`, ext);
+        mark(_tm, 'uploaded');
+        if (!url) { await sendMessage(token, chatId, "Couldn’t save that image — try again."); return null; }
+        recordUpload(chatId, { name: 'the property photo', kind: 'photo', supported: true, readable: 'images' });
+        return url;
+      },
+      inject: (urls) => injectPhotosAndReply(token, chatId, urls),
+    });
     mark(_tm, 'agentReply');
   } catch (e) {
     console.error('handlePhoto error:', (e && e.message) || e);
     try { await sendMessage(token, chatId, "Hit an error saving that photo — send it again."); } catch { /* ignore */ }
   } finally {
-    if (lockTaken) await sbReleaseLock(chatId);
     stop();
     commitTiming(_tm);
   }
@@ -965,14 +986,17 @@ export default async function handler(req, res) {
       await sbUpsert(sentinel, 'selftest-session', 'selftest-env');
       const a1 = await batchAppend(sentinel, 'comp', { tag: 'one' });
       if (a1.fallback) { await sbDelete(sentinel); return res.status(200).json({ selftest: 'batch', ok: false, columnPresent: false, reason: 'pending_batch column missing — run: ALTER TABLE telegram_sessions ADD COLUMN IF NOT EXISTS pending_batch jsonb;' }); }
-      const a2 = await batchAppend(sentinel, 'comp', { tag: 'two' });
+      await batchMarkQueued(sentinel, 'comp');                       // sets the multi-file flag the leader announces on
+      await batchAppend(sentinel, 'comp', { tag: 'two' });
       const mid = await sbGet(sentinel);
       const buffered = mid && mid.pending_batch && mid.pending_batch.comp ? mid.pending_batch.comp.items.length : 0;
-      const stale = await batchSettle(sentinel, 'comp', a1.myToken); // superseded -> null
-      const drained = await batchSettle(sentinel, 'comp', a2.myToken); // settler -> [one, two]
+      const queued = !!(mid && mid.pending_batch && mid.pending_batch.comp && mid.pending_batch.comp.queued);
+      const drained = await drainBatch(sentinel, 'comp');           // settler drains both
+      const after = await sbGet(sentinel);
+      const cleared = !(after && after.pending_batch && after.pending_batch.comp);
       await sbDelete(sentinel);
-      const ok = buffered === 2 && stale === null && Array.isArray(drained) && drained.length === 2;
-      return res.status(200).json({ selftest: 'batch', ok, columnPresent: true, buffered, staleGotNull: stale === null, drainedCount: Array.isArray(drained) ? drained.length : null });
+      const ok = buffered === 2 && queued && Array.isArray(drained) && drained.length === 2 && cleared;
+      return res.status(200).json({ selftest: 'batch', ok, columnPresent: true, buffered, queued, drainedCount: Array.isArray(drained) ? drained.length : null, cleared });
     } catch (e) {
       try { await sbDelete(sentinel); } catch { /* ignore */ }
       return res.status(200).json({ selftest: 'batch', ok: false, error: String((e && e.message) || e) });
