@@ -18,7 +18,7 @@ import { dirname, join } from 'node:path';
 export const config = { maxDuration: 60 };
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-28-om-3';
+const VERSION = '2026-06-29-om-4';
 
 // The template ships INSIDE the function bundle (vercel.json includeFiles) and is read from the local
 // filesystem so every render uses the just-deployed version — no GitHub-raw CDN cache window (which once
@@ -731,7 +731,10 @@ function buildOmVars(payload, broker, maps = {}) {
 
   // photo distribution: cover hero, then property photos cycle through the four section dividers + back.
   const propUrls = (Array.isArray(photos.property_urls) ? photos.property_urls : []).map(httpUrl).filter(Boolean);
-  const coverUrl = httpUrl(photos.cover_url) || propUrls[0] || null;
+  // PHOTO_NEEDED sentinel: render a clean placeholder cover (no fallback) when the broker has no
+  // usable cover photo yet (e.g. awaiting a fresh drone aerial). Bug 1/5.
+  const coverNeeded = photos.cover_url === 'PHOTO_NEEDED' || photos.cover_needed === true;
+  const coverUrl = coverNeeded ? null : (httpUrl(photos.cover_url) || propUrls[0] || null);
   const pick = (i) => propUrls.length ? propUrls[i % propUrls.length] : null;
 
   const offeringRows = [
@@ -792,6 +795,7 @@ function buildOmVars(payload, broker, maps = {}) {
     PROPERTY_NAME_BR: esc(p.name || '').replace(/ /g, '<br>'),
     ADDRESS_LINE1: esc(line1 || ''), CITY_STATE_ZIP: esc(cityZip || ''), ADDRESS_FULL: esc(addrFull),
     COVER_PHOTO_STYLE: omBg(coverUrl),
+    COVER_PHOTO_PH: coverNeeded ? '<div class="cover-ph">Cover photography forthcoming</div>' : '',
     BACK_PHOTO_STYLE: omBg(httpUrl(photos.back_url) || coverUrl),
     DIVIDER_PHOTO_1_STYLE: omBg(pick(0)), DIVIDER_PHOTO_2_STYLE: omBg(pick(1)),
     DIVIDER_PHOTO_3_STYLE: omBg(pick(2)), DIVIDER_PHOTO_4_STYLE: omBg(pick(3)),
