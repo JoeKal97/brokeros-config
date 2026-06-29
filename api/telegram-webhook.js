@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-17-tg-23-agentreq';
+const VERSION = '2026-06-29-tg-24-finvision';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -111,6 +111,9 @@ const normCmd = (s) => String(s || '')
   .replace(/\bb\.?\s*p\.?\s*o\.?\b/gi, 'bpo')
   .replace(/\b(?:o\.?\s*m\.?|oh[\s-]*em|ohm|peo|p\.\s*o\.?)\b/gi, 'om');
 const isFreshStart = (text) => { const t = normCmd(text); return BARE_START_RE.test(t) || NEWBPO_RE.test(t) || NEWOM_RE.test(t); };
+// Which doc type a fresh-start phrase implies: explicit OM triggers -> 'om', everything else -> 'bpo'
+// (bare "/new" defaults to bpo, matching the bare-start intake injection below).
+const freshDocType = (text) => NEWOM_RE.test(normCmd(text)) ? 'om' : 'bpo';
 const END_RE = /^\s*\/?(cancel|done|reset|stop)\b/i;
 const RETRY_RE = /^\s*\/?(retry|resend|try\s*again|again|yes|yep|yeah|yup|ok(ay)?|sure|go|please)\b/i; // after a failed generation
 
@@ -296,6 +299,11 @@ async function sbPatch(chatId, fields) {
 }
 // Mark a chat as actively generating and stash the exact payload so a retry can re-POST it
 // without another agent round trip.
+// Active doc type for the session ('om' | 'bpo' | null). Lets the bridge route an uploaded PDF
+// (financial vision vs comp parser) and word acks correctly BEFORE the GENERATE_* signal fires.
+// Degrades to null (PATCH no-ops) until the `active_doc_type` column exists — see DEPLOY notes.
+const sbSetDocType = (chatId, docType) => sbPatch(chatId, { active_doc_type: docType });
+async function sbGetDocType(chatId) { const row = await sbGet(chatId); return row ? (row.active_doc_type || null) : null; }
 const sbMarkGenerating = (chatId, payload) => sbPatch(chatId, { status: 'generating', generating_since: new Date().toISOString(), last_payload: payload });
 const sbMarkFailed = (chatId) => sbPatch(chatId, { status: 'generate_failed', generating_since: null }); // keep last_payload for retry
 const sbMarkDelivered = (chatId) => sbPatch(chatId, { status: 'delivered', generating_since: null, last_active: new Date().toISOString() }); // keep session + last_payload for post-delivery edits; stamp the window start
@@ -527,11 +535,12 @@ async function collectEvents(sessionId) {
   for await (const e of anthropic.beta.sessions.events.list(sessionId, { order: 'asc' })) evs.push(e);
   return evs;
 }
-// Send one user turn into an existing session; return only the NEW agent text for this turn.
-async function sendTurn(sessionId, text, deadlineMs) {
+// Send one user turn (arbitrary content blocks) into an existing session; return only the NEW
+// agent text for this turn. Content is the Anthropic content-block array (text and/or image).
+async function sendTurnContent(sessionId, content, deadlineMs) {
   const anthropic = await getAnthropic();
   const baseline = (await collectEvents(sessionId)).length;
-  await anthropic.beta.sessions.events.send(sessionId, { events: [{ type: 'user.message', content: [{ type: 'text', text }] }] });
+  await anthropic.beta.sessions.events.send(sessionId, { events: [{ type: 'user.message', content }] });
   while (Date.now() < deadlineMs) {
     const tail = (await collectEvents(sessionId)).slice(baseline);
     if (tail.some((e) => TERMINAL.has(e.type))) {
@@ -541,6 +550,8 @@ async function sendTurn(sessionId, text, deadlineMs) {
   }
   return '';
 }
+// Text-only turn (the common case).
+const sendTurn = (sessionId, text, deadlineMs) => sendTurnContent(sessionId, [{ type: 'text', text }], deadlineMs);
 
 // ---- generate signal + PDF delivery ----
 function extractGenerate(reply) {
@@ -628,9 +639,14 @@ async function runTurn(token, chatId, incoming, ctx) {
   let row = ctx.row;
   let buildAcked = ctx.buildAcked || false;
   const { genIntent, wantStart } = ctx;
+  const freshDoc = wantStart ? freshDocType(incoming) : null; // 'om' | 'bpo' for a fresh start
 
   // Generate-intent: lock is held and we will run the turn -> acknowledge the BUILD immediately.
-  if (genIntent && !buildAcked) { await sendMessage(token, chatId, 'Got it — building your BPO now ⏳'); buildAcked = true; }
+  if (genIntent && !buildAcked) {
+    const dt = freshDoc || await sbGetDocType(chatId);
+    await sendMessage(token, chatId, `Got it — building your ${dt === 'om' ? 'OM' : 'BPO'} now ⏳`);
+    buildAcked = true;
+  }
 
   // RETRY after a failed generation: re-run the stashed payload directly. Any other message clears
   // the failed state and routes to the agent normally (so the broker can correct data instead).
@@ -657,6 +673,7 @@ async function runTurn(token, chatId, incoming, ctx) {
     sessionId = s.id;
     await sbUpsert(chatId, sessionId, s.envId);
     await sbClearState(chatId);
+    await sbSetDocType(chatId, freshDoc || 'bpo'); // tag OM vs BPO so PDF routing + acks know the doc type
     if (!ctx.lockTaken) { await sbAcquireLock(chatId); ctx.lockTaken = true; } // lock the fresh turn (row now exists)
   } else {                              // REUSE: same stateful session = memory
     sessionId = row.session_id;
@@ -823,6 +840,76 @@ async function handleCompPdf(token, chatId, doc) {
     console.error('handleCompPdf error:', (e && e.message) || e);
     try { await sendMessage(token, chatId, `Got ${doc.file_name || 'your PDF'}, but hit an error reading it. You can type the comp details instead.`); } catch { /* ignore */ }
   } finally {
+    stop();
+  }
+}
+
+// ---- FINANCIAL PDF (OM intake step 3): render page 1, let the AGENT read it via vision ----------
+// Brain/bridge split: the bridge renders the page to an image; the agent reads the figures and asks
+// the broker to confirm. No OCR, no server-side parsing — financial docs are too varied. PDF page 1
+// only (the agent flags if key figures are elsewhere); never invents a number.
+async function pdfFirstPagePng(pdfBytes) {
+  try {
+    const mupdf = await import('mupdf');
+    const doc = mupdf.Document.openDocument(new Uint8Array(pdfBytes), 'application/pdf');
+    if (doc.countPages() < 1) return null;
+    const scale = 150 / 72; // 150 DPI: ~1275x1650 for Letter — ample for Claude to read figures, smaller payload than 300
+    const pix = doc.loadPage(0).toPixmap(mupdf.Matrix.scale(scale, scale), mupdf.ColorSpace.DeviceRGB, false, true);
+    return Buffer.from(pix.asPNG());
+  } catch (e) { console.error('pdfFirstPagePng:', (e && e.message) || e); return null; }
+}
+
+async function handleFinancialPdf(token, chatId, doc) {
+  const stop = startTyping(token, chatId);
+  let lockTaken = false;
+  try {
+    lockTaken = await fileGateAcquire(token, chatId, 'Got it — reading the financials…');
+    if (!lockTaken) return;
+
+    const meta = await tgGetFile(token, doc.file_id);
+    const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
+    if (!bytes) { await sendMessage(token, chatId, `Got ${doc.file_name || 'your file'}, but couldn't download it. Try again or type the figures.`); return; }
+
+    const pngBuf = await pdfFirstPagePng(bytes);
+    if (!pngBuf) { await sendMessage(token, chatId, `Got ${doc.file_name || 'your PDF'}, but couldn't render it. Try again or type the figures.`); return; }
+
+    let row = await sbGet(chatId);
+    let sessionId;
+    if (!row || !row.session_id) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
+    else sessionId = row.session_id;
+
+    // The image rides as a real vision content block; the text is the extraction instruction only.
+    const instruction =
+      `[The broker uploaded a financial summary PDF "${doc.file_name || 'financials.pdf'}". The bridge rendered page 1 as the image below — READ IT VISUALLY. ` +
+      `Extract these if clearly visible: current gross rents, other income/recoveries, operating expenses, current NOI, pro-forma gross rents, pro-forma NOI. ` +
+      `Return ONLY what you can clearly read — mark anything unreadable or absent as PENDING; NEVER invent a figure. If the key figures are on a later page, say so and ask the broker to provide them. ` +
+      `Show the broker what you read for confirmation, e.g.:\n` +
+      `"Here's what I read from the financials:\n• Current Gross Rents: $X\n• Operating Expenses: $X\n• Current NOI: $X (X.XX% at the asking price)\n• Pro Forma NOI: $X (X.XX%)\nConfirm or correct any figures — I'll mark anything I couldn't read as PENDING."\n` +
+      `Do NOT emit GENERATE_OM yet — this is the financials step, not the end of intake.]`;
+    const content = [
+      { type: 'text', text: instruction },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: pngBuf.toString('base64') } },
+    ];
+
+    const deadline = Date.now() + 200000;
+    let reply;
+    try { reply = await sendTurnContent(sessionId, content, deadline); }
+    catch (e) {
+      const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId);
+      reply = await sendTurnContent(sessionId, content, deadline);
+    }
+    if (!reply) { await sendMessage(token, chatId, `Read the PDF but couldn't get a response in time. Try again or type the figures.`); return; }
+
+    const payload = extractGenerate(reply);
+    if (payload) { await runGeneration(token, chatId, payload); return; }
+    await sbTouch(chatId);
+    await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM)\s*/i, '').trim() || reply);
+
+  } catch (e) {
+    console.error('handleFinancialPdf error:', (e && e.message) || e);
+    try { await sendMessage(token, chatId, `Hit an error reading that PDF. Try again or type the figures.`); } catch { /* ignore */ }
+  } finally {
+    if (lockTaken) await sbReleaseLock(chatId);
     stop();
   }
 }
@@ -1118,16 +1205,22 @@ export default async function handler(req, res) {
   if (type === 'document') {
     const doc = msg.document;
     const xlsx = isXlsxDoc(doc);
-    const compPdf = !xlsx && isCompPdf(doc);
-    const mode = xlsx ? 'xlsx' : compPdf ? 'comp-pdf' : 'unsupported-file';
+    const isPdf = !xlsx && isCompPdf(doc); // isCompPdf() matches all PDFs; OM-vs-comp decided by session below
+    const mode = xlsx ? 'xlsx' : isPdf ? 'pdf' : 'unsupported-file';
     res.status(200).json({ ok: true, version: VERSION, type, mode });
-    if ((xlsx || compPdf) && !sbConfigured()) {
+    if ((xlsx || isPdf) && !sbConfigured()) {
       waitUntil((async () => { try { await sendMessage(token, chatId, '⚙️ Session store not configured yet — add SUPABASE_URL and SUPABASE_SERVICE_KEY in Vercel and redeploy.'); } catch { /* ignore */ } })());
       return;
     }
-    waitUntil(xlsx ? handleXlsx(token, chatId, doc)
-      : compPdf ? handleCompPdf(token, chatId, doc)
-      : handleUnsupportedFile(token, chatId, doc.file_name, 'document'));
+    waitUntil((async () => {
+      if (xlsx) return handleXlsx(token, chatId, doc);
+      if (isPdf) {
+        // A PDF during an OM session = a financial summary (Claude vision); otherwise the MLS comp parser.
+        const docType = await sbGetDocType(chatId);
+        return docType === 'om' ? handleFinancialPdf(token, chatId, doc) : handleCompPdf(token, chatId, doc);
+      }
+      return handleUnsupportedFile(token, chatId, doc.file_name, 'document');
+    })());
     return;
   }
 

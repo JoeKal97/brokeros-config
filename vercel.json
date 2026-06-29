@@ -7,6 +7,10 @@
     "api/generate-pdf.js": {
       "maxDuration": 60,
       "includeFiles": "{brokeros-template.html,brokeros-om-template.html}"
+    },
+    "api/telegram-webhook.js": {
+      "maxDuration": 300,
+      "includeFiles": "node_modules/mupdf/dist/**"
     }
   }
 }
