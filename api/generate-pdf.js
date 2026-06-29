@@ -18,7 +18,7 @@ import { dirname, join } from 'node:path';
 export const config = { maxDuration: 60 };
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-29-om-4';
+const VERSION = '2026-06-29-om-5';
 
 // The template ships INSIDE the function bundle (vercel.json includeFiles) and is read from the local
 // filesystem so every render uses the just-deployed version — no GitHub-raw CDN cache window (which once
@@ -564,9 +564,12 @@ function omDesc(txt) {
 const httpUrl = (u) => (u && /^https?:\/\//i.test(String(u))) ? String(u) : null;
 // Cover/divider/back full-bleed background: a CSS value, or '' (template's dark gradient fallback shows).
 const omBg = (u) => httpUrl(u) ? "background-image:url('" + esc(httpUrl(u)) + "')" : '';
-// Content <img> for a URL (or a grey placeholder of the same footprint when absent).
+// Content <img> for an http(s) URL OR a data:image URI (server-generated maps come back as base64
+// data URIs — httpUrl() alone would reject them and fall through to the placeholder), else a grey
+// placeholder of the same footprint.
+const imgSrc = (u) => (u && /^(https?:\/\/|data:image\/)/i.test(String(u))) ? String(u) : null;
 function omImg(u, { style = '', cls = 'full-img', phCls = 'img-ph-lg', phText = 'Image' } = {}) {
-  const url = httpUrl(u);
+  const url = imgSrc(u);
   return url
     ? '<img class="' + cls + '" src="' + esc(url) + '"' + (style ? ' style="' + style + '"' : '') + '>'
     : '<div class="' + phCls + '"' + (style ? ' style="' + style + '"' : '') + '>' + esc(phText) + '</div>';
@@ -821,15 +824,15 @@ function buildOmVars(payload, broker, maps = {}) {
     PHOTOS_NOTE: omNote(photos.note),
 
     // site plan / aerial
-    SITE_PLAN_IMG: omImg(httpUrl(photos.site_plan_url), { style: 'max-height:7.2in;max-width:100%', phText: 'Site Plan' }),
+    SITE_PLAN_IMG: omImg(imgSrc(photos.site_plan_url), { style: 'max-height:7.2in;max-width:100%', phText: 'Site Plan' }),
     SITE_PLAN_NOTE: omNote(photos.site_plan_note),
-    AERIAL_IMG: omImg(httpUrl(photos.aerial_url) || maps.aerial, { style: 'max-height:7.2in;max-width:100%', phText: 'Aerial' }),
+    AERIAL_IMG: omImg(imgSrc(photos.aerial_url) || maps.aerial, { style: 'max-height:7.2in;max-width:100%', phText: 'Aerial' }),
     AERIAL_NOTE: omNote(photos.aerial_note),
 
     // market
     MARKET_TITLE: esc(market.title || (market.city ? market.city + (market.state ? ', ' + market.state : '') : 'Market Overview')),
     MARKET_NARRATIVE: omParas(market.narrative || ''),
-    MARKET_PHOTO: omImg(httpUrl(market.photo_url) || pick(4), { style: 'width:100%;height:5.6in;object-fit:cover', cls: '', phCls: 'photo-ph', phText: 'Market Photo' }),
+    MARKET_PHOTO: omImg(imgSrc(market.photo_url) || pick(4), { style: 'width:100%;height:5.6in;object-fit:cover', cls: '', phCls: 'photo-ph', phText: 'Market Photo' }),
     MARKET_PHOTO_NOTE: omNote(market.photo_caption),
 
     // financial summary (all server-side math)
@@ -839,7 +842,7 @@ function buildOmVars(payload, broker, maps = {}) {
     RING_1: demo && demo.rings ? esc(demo.rings[0] || '') : '',
     RING_2: demo && demo.rings ? esc(demo.rings[1] || '') : '',
     RING_3: demo && demo.rings ? esc(demo.rings[2] || '') : '',
-    DEMO_MAP_IMG: omImg(httpUrl(photos.demographics_map_url) || maps.demoRing, { style: 'max-height:6.8in;max-width:100%', phText: 'Demographics Map' }),
+    DEMO_MAP_IMG: omImg(imgSrc(photos.demographics_map_url) || maps.demoRing, { style: 'max-height:6.8in;max-width:100%', phText: 'Demographics Map' }),
     DEMO_POP_ROWS: demo ? omDemoRows(demo.population) : '',
     DEMO_HH_ROWS: demo ? omDemoRows(demo.households) : '',
     DEMO_SOURCE: demo && demo.source ? esc(demo.source) : '',
@@ -874,7 +877,7 @@ async function buildOmMaps(payload, key) {
   const geoAddr = p.geocode_address
     || [String(p.address_line1 || addrFull).replace(/(\d+)\s*[–—-]\s*\d+/, '$1'), cityZip].filter(Boolean).join(', ');
   // Aerial: only generate a satellite map if the broker did NOT supply an aerial image.
-  const aerialP = httpUrl(photos.aerial_url) ? Promise.resolve(null) : omSatelliteAerial(geoAddr, key);
+  const aerialP = imgSrc(photos.aerial_url) ? Promise.resolve(null) : omSatelliteAerial(geoAddr, key);
   // Demographics ring map: parse ring miles from the ring labels ("0.5 Miles" -> 0.5).
   const ringMiles = demo && Array.isArray(demo.rings)
     ? demo.rings.map((s) => parseFloat(String(s))).filter((n) => isFinite(n)) : [];
