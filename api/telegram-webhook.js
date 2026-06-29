@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-29-tg-24-finvision';
+const VERSION = '2026-06-29-tg-25-omphotos';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -1016,10 +1016,20 @@ async function injectPhotosAndReply(token, chatId, urls) {
   if (!row || !row.session_id) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
   else sessionId = row.session_id;
   const n = urls.length, many = n > 1;
-  await sendMessage(token, chatId, many ? `Got your ${n} photos — I’ll place them across the BPO.` : 'Got the property photo.');
-  const injection =
-    `[The broker sent ${n} SUBJECT PROPERTY photo${many ? 's together (a batch)' : ''}. Public URL${many ? 's IN ORDER' : ''}:\n${urls.join('\n')}\n` +
-    `APPEND ${many ? 'all of these' : 'this URL'} to subject.photo_urls — an ORDERED array. KEEP any URLs already there and add ${many ? 'these' : 'this one'} to the end; never drop earlier photos. The FIRST photo ever received is the cover hero; the rest the server distributes across the BPO (exec summary, section dividers, comps subject row). Do not ask for the cover again. The broker was ALREADY told the count, so do NOT re-list or re-count the photos — acknowledge in at most one short line (or nothing) and continue the flow.]`;
+  // OM photos use a different payload schema (photos.cover_url + photos.property_urls[]) than the BPO
+  // (subject.photo_urls[]). Route the injection by the session's active_doc_type so OM photos land in
+  // the right fields instead of silently vanishing. BPO branch is unchanged.
+  const isOm = !!(row && row.active_doc_type === 'om');
+  await sendMessage(token, chatId, many ? `Got your ${n} photos — I’ll place them across the ${isOm ? 'OM' : 'BPO'}.` : 'Got the property photo.');
+  const injection = isOm
+    ? `[The broker sent ${n} property photo${many ? 's together (a batch)' : ''} for the OM. Public URL${many ? 's IN ORDER' : ''}:\n${urls.join('\n')}\n` +
+      `OM PHOTO RULES:\n` +
+      `- The FIRST photo ever received across ALL batches goes into photos.cover_url (the cover hero). If photos.cover_url is already set, do NOT replace it.\n` +
+      `- ALL remaining photos (everything after the first) go into photos.property_urls — an ORDERED array. APPEND to any URLs already there; never drop earlier ones.\n` +
+      `- Do NOT assign these batch photos to aerial_url or site_plan_url — those are collected separately (the broker is asked for them explicitly).\n` +
+      `- The broker was ALREADY told the count. Do NOT re-list or re-count the photos — acknowledge in at most one short line (or nothing) and continue the OM intake flow.]`
+    : `[The broker sent ${n} SUBJECT PROPERTY photo${many ? 's together (a batch)' : ''}. Public URL${many ? 's IN ORDER' : ''}:\n${urls.join('\n')}\n` +
+      `APPEND ${many ? 'all of these' : 'this URL'} to subject.photo_urls — an ORDERED array. KEEP any URLs already there and add ${many ? 'these' : 'this one'} to the end; never drop earlier photos. The FIRST photo ever received is the cover hero; the rest the server distributes across the BPO (exec summary, section dividers, comps subject row). Do not ask for the cover again. The broker was ALREADY told the count, so do NOT re-list or re-count the photos — acknowledge in at most one short line (or nothing) and continue the flow.]`;
   const deadline = Date.now() + 200000;
   let reply;
   try { reply = await sendTurn(sessionId, injection, deadline); }
