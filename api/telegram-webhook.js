@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-29-tg-25-omphotos';
+const VERSION = '2026-06-29-tg-26-postgen';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -561,6 +561,14 @@ function extractGenerate(reply) {
   if (!jtxt) return null;
   try { return JSON.parse(jtxt); } catch { return null; }
 }
+// Order-insensitive deep-equality for payloads (canonical JSON) — used to detect a post-gen
+// correction that changes nothing, so the bridge never claims a rebuild that didn't happen.
+function canonJson(v) {
+  if (Array.isArray(v)) return '[' + v.map(canonJson).join(',') + ']';
+  if (v && typeof v === 'object') return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + canonJson(v[k])).join(',') + '}';
+  return JSON.stringify(v === undefined ? null : v);
+}
+const payloadsEqual = (a, b) => { try { return canonJson(a) === canonJson(b); } catch { return false; } };
 // Call /api/generate-pdf with the payload. Returns a structured result; NO Telegram messaging
 // here (the bridge owns all broker-facing wording, based on the actual outcome).
 async function generatePdf(payload) {
@@ -701,7 +709,20 @@ async function runTurn(token, chatId, incoming, ctx) {
   if (!reply) { await sendMessage(token, chatId, "Sorry — I couldn't get a reply in time. Please try again."); return; }
 
   const payload = extractGenerate(reply);
-  if (payload) { await runGeneration(token, chatId, payload, { ackedBuilding: buildAcked }); return; }
+  if (payload) {
+    // POST-GEN NO-OP GUARD (Part P3c rule: the bridge reports from ACTUAL results, never narrates a
+    // change it can't verify). If this is a correction to an already-delivered doc and the re-emitted
+    // payload is byte-identical to what we last built, nothing changed — say so instead of falsely
+    // running "Building…/ready" on an unchanged rebuild.
+    if (editingDelivered && row && row.last_payload && payloadsEqual(payload, row.last_payload)) {
+      const docLabel = payload.doc_type === 'om' ? 'OM' : 'BPO';
+      await sbTouch(chatId);
+      await sendMessage(token, chatId, `That's already in the ${docLabel} as it stands — nothing changed in the document. If you want a specific edit, tell me exactly what to change (e.g. a different value, or "add it as a separate page/section").`);
+      return;
+    }
+    await runGeneration(token, chatId, payload, { ackedBuilding: buildAcked });
+    return;
+  }
 
   await sbTouch(chatId);
   await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM)\s*/i, '').trim() || reply);

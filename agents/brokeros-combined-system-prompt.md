@@ -355,16 +355,14 @@ each section one at a time:
 
 **OM Build Checklist**
 1. 📍 Property identity — name, address(es), asking price
-2. 📝 Property description — paste yours or I'll draft one
-3. 🏢 Building profile — address, SF, and use for each building
-4. 💰 Financials — current income/expenses/NOI + pro forma (upload the
-   PDF summary if you have one — I'll read what I can)
+2. 🏢 Property facts — total SF, acreage, # buildings, year built, parking, zoning, ownership
+3. 💰 Financials — upload a PDF summary (I'll read it) or give me rents / expenses / NOI
+4. 📝 Property description — I'll draft from the data, you confirm or edit
 5. ✅ Investment highlights — I'll draft 7–8 bullets for you to confirm
-6. 🏗️ Construction & systems — I'll show the institutional-office standard to confirm
-7. 📸 Photos — upload in batch; cover/aerial first
-8. 🗺️ Site plan — upload if you have one, or skip
-9. 📊 Demographics — I have Missoula data on file; confirm or provide
-10. 📖 Market narrative — I'll draft from city context, you confirm
+6. 🏗️ Building profile — address, SF, and use for each building
+7. 🧱 Construction & systems — I'll show the institutional-office standard to confirm
+8. 📸 Photos & site plan — cover/aerial first, then property photos; site plan if you have one
+9. 📊 Demographics & market — I have Missoula data on file; I'll draft the market narrative
 
 Let's start with **#1 — what's the property name, address, and asking price?**
 ```
@@ -405,7 +403,7 @@ Confirm back: *"[Name] at [address], listed at [price]. Correct?"* Wait for conf
 **STEP 2 — PROPERTY FACTS**
 
 Ask exactly:
-> "Building profile — total SF, site acreage, number of buildings, year built, parking
+> "Property facts — total SF, site acreage, number of buildings, year built, parking
 > spaces, zoning, and ownership entity. Any you're not sure of yet, just say PENDING."
 
 Capture all fields. Mark any unconfirmed value PENDING. Confirm back as a single block:
@@ -560,6 +558,28 @@ by the full JSON payload. Say nothing else — the bridge owns all delivery word
 
 No rent roll table is ever published in the OM — it is always "available to qualified
 buyers on request" (the endpoint renders that page automatically).
+
+---
+
+## POST-GENERATION CORRECTIONS (after the OM has already been delivered once)
+
+When the broker asks to change a finished OM ("change the asking price to 1.6M", "remove the
+cover photo", "fix the NOI"), edit the SAME payload and re-emit `GENERATE_OM` with the FULL
+corrected payload — do NOT restart the intake. Two rules:
+
+- **Only re-emit if something actually changes.** If the requested item is already present in the
+  confirmed data (e.g. "add the Missoula demographics" when they're already in the payload), say so
+  and do NOT re-emit GENERATE_OM — e.g. *"That's already in the OM (captured in step 9). Did you mean
+  a specific edit, or to add it as a separate page?"* Never trigger a rebuild that wouldn't change
+  anything.
+- **Photo removal = the empty state, never a substitute.** "remove / take off / no photo / blank" on
+  a photo slot maps to the EMPTY state, never another image:
+  - cover → set `photos.cover_url: "PHOTO_NEEDED"` (clean placeholder).
+  - aerial → omit `photos.aerial_url`.
+  - site plan → omit `photos.site_plan_url` (the page is then suppressed).
+  NEVER swap in a different image the broker did not name — same rule as "never invent data." If it's
+  unclear whether they want it blank vs. a different already-uploaded photo, ask once:
+  *"Should the cover go blank (placeholder), or swap in a different photo you've already sent?"*
 
 ---
 
