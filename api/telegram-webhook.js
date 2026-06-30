@@ -38,7 +38,7 @@ import { waitUntil } from '@vercel/functions';
 // turn ample headroom so it never times out from the broker's view.
 export const config = { maxDuration: 300 };
 
-const VERSION = '2026-06-29-tg-26-postgen';
+const VERSION = '2026-06-30-tg-27-allpages';
 
 // --- latency diagnostics (observability only; read via GET ?selftest=timing) ---
 const MODULE_LOADED_AT = Date.now();
@@ -865,19 +865,28 @@ async function handleCompPdf(token, chatId, doc) {
   }
 }
 
-// ---- FINANCIAL PDF (OM intake step 3): render page 1, let the AGENT read it via vision ----------
-// Brain/bridge split: the bridge renders the page to an image; the agent reads the figures and asks
-// the broker to confirm. No OCR, no server-side parsing — financial docs are too varied. PDF page 1
-// only (the agent flags if key figures are elsewhere); never invents a number.
-async function pdfFirstPagePng(pdfBytes) {
+// ---- FINANCIAL PDF (OM intake step 3): render EVERY page, let the AGENT read them via vision -------
+// Brain/bridge split: the bridge renders each page to an image; the agent reads the figures and asks
+// the broker to confirm. No OCR, no server-side parsing — financial docs are too varied. ALL pages
+// (the P&L/income statement is rarely page 1 in real QuickBooks exports — Palmer's was ~page 32);
+// the agent finds the right page itself and never invents a number.
+const PDF_PAGE_CAP = 50; // bounds compute + stays under Anthropic's ~100-images-per-request limit
+async function pdfAllPagesPng(pdfBytes) {
   try {
     const mupdf = await import('mupdf');
     const doc = mupdf.Document.openDocument(new Uint8Array(pdfBytes), 'application/pdf');
-    if (doc.countPages() < 1) return null;
-    const scale = 150 / 72; // 150 DPI: ~1275x1650 for Letter — ample for Claude to read figures, smaller payload than 300
-    const pix = doc.loadPage(0).toPixmap(mupdf.Matrix.scale(scale, scale), mupdf.ColorSpace.DeviceRGB, false, true);
-    return Buffer.from(pix.asPNG());
-  } catch (e) { console.error('pdfFirstPagePng:', (e && e.message) || e); return null; }
+    const total = doc.countPages();
+    if (total < 1) return [];
+    const n = Math.min(total, PDF_PAGE_CAP);
+    if (total > PDF_PAGE_CAP) console.warn(`pdfAllPagesPng: PDF has ${total} pages — capping at ${PDF_PAGE_CAP}`);
+    const scale = 150 / 72; // 150 DPI: ~1275x1650 for Letter — ample for Claude to read figures
+    const pages = [];
+    for (let i = 0; i < n; i++) {
+      const pix = doc.loadPage(i).toPixmap(mupdf.Matrix.scale(scale, scale), mupdf.ColorSpace.DeviceRGB, false, true);
+      pages.push(Buffer.from(pix.asPNG()));
+    }
+    return pages;
+  } catch (e) { console.error('pdfAllPagesPng:', (e && e.message) || e); return []; }
 }
 
 async function handleFinancialPdf(token, chatId, doc) {
@@ -891,25 +900,25 @@ async function handleFinancialPdf(token, chatId, doc) {
     const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
     if (!bytes) { await sendMessage(token, chatId, `Got ${doc.file_name || 'your file'}, but couldn't download it. Try again or type the figures.`); return; }
 
-    const pngBuf = await pdfFirstPagePng(bytes);
-    if (!pngBuf) { await sendMessage(token, chatId, `Got ${doc.file_name || 'your PDF'}, but couldn't render it. Try again or type the figures.`); return; }
+    const pages = await pdfAllPagesPng(bytes);
+    if (!pages.length) { await sendMessage(token, chatId, `Got ${doc.file_name || 'your PDF'}, but couldn't render it. Try again or type the figures.`); return; }
 
     let row = await sbGet(chatId);
     let sessionId;
     if (!row || !row.session_id) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
     else sessionId = row.session_id;
 
-    // The image rides as a real vision content block; the text is the extraction instruction only.
+    // All pages ride as ordered vision content blocks; the text is the extraction instruction only.
     const instruction =
-      `[The broker uploaded a financial summary PDF "${doc.file_name || 'financials.pdf'}". The bridge rendered page 1 as the image below — READ IT VISUALLY. ` +
-      `Extract these if clearly visible: current gross rents, other income/recoveries, operating expenses, current NOI, pro-forma gross rents, pro-forma NOI. ` +
-      `Return ONLY what you can clearly read — mark anything unreadable or absent as PENDING; NEVER invent a figure. If the key figures are on a later page, say so and ask the broker to provide them. ` +
+      `[The broker uploaded a financial PDF "${doc.file_name || 'financials.pdf'}" — ${pages.length} page${pages.length > 1 ? 's' : ''} rendered below as images, in order. READ THEM VISUALLY and find the income statement / P&L / NOI summary (it is often NOT page 1 — in real exports it can be deep in the document). ` +
+      `Extract: current gross rents, other income/recoveries, operating expenses, current NOI, pro-forma gross rents, pro-forma NOI. ` +
+      `Return ONLY what you can clearly read — mark anything unreadable or absent as PENDING; NEVER invent a figure. ` +
       `Show the broker what you read for confirmation, e.g.:\n` +
       `"Here's what I read from the financials:\n• Current Gross Rents: $X\n• Operating Expenses: $X\n• Current NOI: $X (X.XX% at the asking price)\n• Pro Forma NOI: $X (X.XX%)\nConfirm or correct any figures — I'll mark anything I couldn't read as PENDING."\n` +
       `Do NOT emit GENERATE_OM yet — this is the financials step, not the end of intake.]`;
     const content = [
       { type: 'text', text: instruction },
-      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: pngBuf.toString('base64') } },
+      ...pages.map((png) => ({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: png.toString('base64') } })),
     ];
 
     const deadline = Date.now() + 200000;
