@@ -18,7 +18,7 @@ import { dirname, join } from 'node:path';
 export const config = { maxDuration: 60 };
 
 // ---- Deploy marker (GET / ?version returns this) ---------------------------
-const VERSION = '2026-06-29-om-5';
+const VERSION = '2026-06-29-om-6-pagenums';
 
 // The template ships INSIDE the function bundle (vercel.json includeFiles) and is read from the local
 // filesystem so every render uses the just-deployed version — no GitHub-raw CDN cache window (which once
