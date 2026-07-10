@@ -917,6 +917,133 @@ async function assembleOm(payload, broker) {
   return { source, filenameSeed: p.name || p.address_line1 || 'offering-memorandum', options };
 }
 
+// ============================================================================
+// FLYER ASSEMBLY  —  doc_type === "flyer"
+// Orion-branded 4-page property flyer (leasing/marketing). Same machine as the
+// BPO/OM: bundled template, {{TOKEN}} fill, form-urlencoded payload=. Portrait
+// 8.5x11. Firm identity comes from the org row the webhook attaches as
+// payload.org (multi-broker firms); every field degrades to the Orion pilot
+// defaults so a bare payload still renders a complete branded document.
+// ============================================================================
+
+const FLYER_TEMPLATE_URL = 'https://raw.githubusercontent.com/JoeKal97/brokeros-config/main/brokeros-flyer-template.html';
+let _flyerTplCache;
+function loadLocalFlyerTemplate() {
+  if (_flyerTplCache !== undefined) return _flyerTplCache;
+  try { _flyerTplCache = readFileSync(join(__dirname, '..', 'brokeros-flyer-template.html'), 'utf8'); }
+  catch (_) { _flyerTplCache = null; }
+  return _flyerTplCache;
+}
+
+const FLYER_FIRM_DEFAULTS = {
+  org_name: 'Orion Commercial Partners',
+  firm_legal: 'ORION Commercial Partners LLC',
+  firm_address_block: '1218 Third Ave<br>Suite 2200<br>Seattle, WA 98101',
+  firm_website: 'www.orioncp.com',
+  co_brokers: [
+    { name: 'Chase Silver', phone: '425.326.0766', email: 'csilver@orioncp.com' },
+    { name: 'Matthew Hinrichs', phone: '206.852.3325', email: 'mhinrichs@orioncp.com' },
+    { name: 'Jack Deane', phone: '206.707.1315', email: 'jdeane@orioncp.com' },
+    { name: 'Bojidar Gabrovski', phone: '847.275.8474', email: 'bgabrovski@orioncp.com' },
+  ],
+};
+
+// Photo slot: real <img> when a URL arrives, styled placeholder div otherwise (never a broken img).
+function flyerPhoto(url, emoji, label, style = '') {
+  const s = style ? ` style="${style}"` : '';
+  if (url) return `<img class="pimg"${s} src="${esc(url)}" alt="${esc(label)}">`;
+  return `<div class="ph"${s}>${emoji}<br>[${esc(label)}]</div>`;
+}
+
+const flyerSf = (v) => { const n = parseInt(String(v == null ? '' : v).replace(/[^0-9]/g, ''), 10); return isNaN(n) ? null : n; };
+const flyerFmtSf = (n) => n.toLocaleString('en-US');
+
+function buildFlyerVars(payload, org) {
+  const brand = (org && org.brand_config) || {};
+  const firmName = (org && org.org_name) || FLYER_FIRM_DEFAULTS.org_name;
+  const roster = (Array.isArray(brand.co_brokers) && brand.co_brokers.length) ? brand.co_brokers : FLYER_FIRM_DEFAULTS.co_brokers;
+
+  // Header line 2: "For Lease | Suite 201 | 9,250 SF Demisable to 3,900 SF"
+  const availN = flyerSf(payload.available_sf);
+  const demisN = flyerSf(payload.demisable_sf);
+  const sfLine = availN
+    ? (demisN ? `${flyerFmtSf(availN)} SF Demisable to ${flyerFmtSf(demisN)} SF` : `${flyerFmtSf(availN)} SF`)
+    : null;
+  const hdrSub = [payload.listing_type || 'For Lease', payload.suite ? ('Suite ' + String(payload.suite).replace(/^suite\s*/i, '')) : null, sfLine]
+    .filter(Boolean).map(esc).join('&ensp;|&ensp;');
+
+  // Floor-plan callout boxes: demisable -> the two suite splits; otherwise one box for the full space.
+  const callouts = (availN && demisN && availN > demisN)
+    ? `<div class="cb">Approx. ${flyerFmtSf(availN - demisN)} SF</div>\n        <div class="cb">Approx. ${flyerFmtSf(demisN)} SF</div>`
+    : (availN ? `<div class="cb">Approx. ${flyerFmtSf(availN)} SF</div>` : '');
+
+  const liList = (arr) => (Array.isArray(arr) ? arr : []).map((h) => '<li>' + esc(h) + '</li>').join('\n        ');
+  const amenities = (Array.isArray(payload.amenities) ? payload.amenities : [])
+    .map((a) => '<li>' + esc(typeof a === 'object' && a !== null ? a.name : a) + '</li>').join('');
+
+  // Footer contacts: the brokers on THIS listing (agent collects co_broker_names); default first two.
+  const names = Array.isArray(payload.co_broker_names) ? payload.co_broker_names : [];
+  let listing = names.length ? roster.filter((b) => names.some((n) => String(n).toLowerCase() === String(b.name).toLowerCase())) : [];
+  if (!listing.length) listing = roster.slice(0, 2);
+  const contacts = listing.map((b, i) =>
+    `<div class="ftr-p${i === 0 ? ' ftr-p-first' : ''}"><span class="n">${esc(b.name)}</span>${esc(b.phone || '')}<br><a href="mailto:${esc(b.email || '')}">${esc(b.email || '')}</a></div>`
+  ).join('\n      ');
+
+  const photos = Array.isArray(payload.photos) ? payload.photos : [];
+  const caps = Array.isArray(payload.photo_captions) ? payload.photo_captions : [];
+  const website = (org && org.firm_website) || FLYER_FIRM_DEFAULTS.firm_website;
+
+  return {
+    PROPERTY_NAME: esc(payload.property_name || payload.address || 'Property Flyer'),
+    FIRM_NAME: esc(firmName),
+    HDR_SUB: hdrSub,
+    ADDRESS: esc(payload.address || ''),
+    PHOTO_HERO: flyerPhoto(photos[0], '📷', 'Exterior / Aerial Hero Photo'),
+    BUILDING_HIGHLIGHTS: liList(payload.building_highlights),
+    PHOTO_P1_SIDE: flyerPhoto(photos[1], '🏢', 'Interior / Aerial Photo', 'height:100%'),
+    PHOTO_FLOORPLAN: flyerPhoto(payload.floor_plan_url, '📐', 'Floor Plan', 'flex:1; min-height:0'),
+    CALLOUTS: callouts,
+    PHOTO_P2_INTERIOR: flyerPhoto(photos[6], '📷', 'Interior Office Photo', 'height:2.8in; flex-shrink:0; margin-bottom:6px'),
+    SPACE_HIGHLIGHTS: liList(payload.space_highlights),
+    RATE_CTA: esc(payload.lease_rate || 'Call Broker for Rates'),
+    FIRM_LEGAL: esc((org && org.firm_legal) || FLYER_FIRM_DEFAULTS.firm_legal),
+    PHOTO_P3_TOP: flyerPhoto(photos[2], '📷', 'Aerial / Parking Photo — Full Width', 'height:100%'),
+    PHOTO_P3_A: flyerPhoto(photos[3], '📷', caps[0] || 'Multipurpose Room'),
+    P3_CAP_A: esc(caps[0] || 'Multipurpose Rooms'),
+    PHOTO_P3_B: flyerPhoto(photos[4], '📷', caps[1] || 'Reception / Waiting Area'),
+    P3_CAP_B: esc(caps[1] || 'Reception / Waiting Area'),
+    PHOTO_P3_C: flyerPhoto(photos[5], '📷', caps[2] || 'Conference Room'),
+    P3_CAP_C: esc(caps[2] || 'Conference Room'),
+    PHOTO_AMENITIES_MAP: flyerPhoto(payload.amenities_map_url, '🗺️', 'Amenities Map — ' + (payload.address || 'Nearby'), 'flex:1; min-height:0'),
+    AMENITY_ITEMS: amenities,
+    FOOTER_CONTACTS: contacts,
+    FIRM_ADDR_BLOCK: (org && org.firm_address ? esc(org.firm_address).replace(/,\s*/g, '<br>') : FLYER_FIRM_DEFAULTS.firm_address_block),
+    FIRM_WEB_URL: 'https://' + String(website).replace(/^https?:\/\//i, ''),
+    FIRM_WEBSITE: esc(website),
+  };
+}
+
+async function assembleFlyer(payload, org) {
+  let tpl = loadLocalFlyerTemplate();
+  if (!tpl) {
+    const r = await fetch(FLYER_TEMPLATE_URL);
+    if (!r.ok) throw new Error('Flyer template fetch failed: HTTP ' + r.status);
+    tpl = await r.text();
+  }
+  let source = fillTemplate(tpl, buildFlyerVars(payload, org));
+  // Brand overrides from the org row: accent color swap + hosted logo (template default is Orion).
+  const brandColor = org && org.brand_config && org.brand_config.primary_color;
+  if (brandColor && /^#[0-9a-fA-F]{6}$/.test(brandColor) && brandColor.toUpperCase() !== '#D9591B') {
+    source = source.split('#D9591B').join(brandColor);
+  }
+  const logoUrl = org && org.logo_url;
+  if (logoUrl && /^https?:\/\//i.test(logoUrl)) {
+    source = source.replace(/(<div class="ftr-logo"><img src=")[^"]*(")/g, '$1' + logoUrl + '$2');
+  }
+  // Template is authored at exact 8.5x11 CSS — render at zoom 1 (not the BPO's 0.88 default).
+  return { source, filenameSeed: payload.property_name || payload.address || 'property-flyer', options: Object.assign({ landscape: false, zoom: 1 }, payload.options || {}) };
+}
+
 export default async function handler(req, res) {
   // Deploy marker: GET (or ?version) returns the running version + which template source is live
   // (bundle = read from the function bundle, no cache window; raw-fallback = bundled file unreadable).
@@ -939,6 +1066,17 @@ export default async function handler(req, res) {
       let payload;
       try { payload = JSON.parse(body.payload); }
       catch { return res.status(400).json({ error: 'Invalid payload', detail: 'payload must be a URL-encoded JSON string' }); }
+
+      if (payload.doc_type === 'flyer') {
+        // Firm flyers are org-branded, not per-broker: no BROKERS registry entry required.
+        // The webhook attaches the resolved org row as payload.org; absent that, Orion defaults apply.
+        const fl = await assembleFlyer(payload, payload.org || null);
+        source = fl.source;
+        filenameSeed = fl.filenameSeed;
+        filePrefix = 'flyer';
+        options = fl.options;
+        // falls through to the shared PDFShift render below
+      } else {
 
       const baseBroker = BROKERS[payload.broker_id];
       if (!baseBroker) return res.status(400).json({ error: 'Unknown broker_id', detail: String(payload.broker_id) });
@@ -966,6 +1104,7 @@ export default async function handler(req, res) {
         filenameSeed = (payload.subject && payload.subject.address_line1) || 'bpo-document';
         options = payload.options || {};
       }
+      } // end non-flyer (BPO/OM) branch
     } else if (body.html_content !== undefined) {
       source = String(body.html_content);
     } else {
@@ -1021,4 +1160,4 @@ function sanitizeFilename(address, prefix = 'bpo') {
 }
 
 // Named exports for local testing (the default export remains the Vercel handler).
-export { assembleOm, buildOmVars, fillTemplate };
+export { assembleOm, buildOmVars, fillTemplate, assembleFlyer, buildFlyerVars };

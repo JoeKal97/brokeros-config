@@ -97,11 +97,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // word PLUS a BPO-ish object (bpo / b.p.o. / one / report / valuation / opinion) — or "start a bpo" /
 // "start over/fresh" — so it NEVER trips on data like "new construction", "new listing", or "start
 // with the address". normCmd folds spoken "B. P. O." -> "bpo" first so dotted/spaced forms match.
-const BARE_START_RE = /^\s*\/?(?:start|new|bpo)\s*$/i;
+const BARE_START_RE = /^\s*\/?(?:start|new|bpo|flyer)\s*$/i;
 const NEWBPO_RE = /\b(?:new|fresh|another)\s+(?:bpo|one|report|valuation|broker'?s?\s+(?:price\s+)?opinion)\b|\b(?:start|begin|create|make|do)\s+(?:an?\s+)?(?:new\s+|fresh\s+|another\s+)?(?:bpo|broker'?s?\s+(?:price\s+)?opinion)\b|\bstart\s+(?:over|fresh|anew)\b/i;
 // OM (offering memorandum) fresh-start. Requires a fresh-intent word + an OM-ish object (om /
 // offering memorandum), or "OM for <property>" — \bom\b boundaries avoid tripping on "from"/"some".
 const NEWOM_RE = /\b(?:new|fresh|another)\s+(?:om|offering\s+memorandum)\b|\b(?:start|begin|create|make|do)\s+(?:an?\s+)?(?:new\s+|fresh\s+|another\s+)?(?:om|offering\s+memorandum)\b|\bom\s+for\b/i;
+// FLYER fresh-start: fresh-intent word + a flyer-ish object ("new flyer", "make a property flyer",
+// "generate flyer"), or "flyer for <property>". "flyer" is a distinctive word — no fold needed.
+const NEWFLYER_RE = /\b(?:new|fresh|another)\s+(?:property\s+|listing\s+|marketing\s+)?flyer\b|\b(?:start|begin|create|make|do|generate)\s+(?:an?\s+)?(?:new\s+|fresh\s+|another\s+)?(?:property\s+|listing\s+|marketing\s+)?flyer\b|\bflyer\s+for\b/i;
 // Fold dotted/spoken acronyms the voice path mangles. BPO fold runs FIRST so "b.p.o." is consumed
 // before the OM fold (otherwise its trailing "p.o." would mis-fold to OM). The OM fold also catches
 // common Whisper mis-transcriptions of spoken "OM": "O.M.", "oh em", "ohm", "peo", "p.o." — the
@@ -110,16 +113,17 @@ const NEWOM_RE = /\b(?:new|fresh|another)\s+(?:om|offering\s+memorandum)\b|\b(?:
 const normCmd = (s) => String(s || '')
   .replace(/\bb\.?\s*p\.?\s*o\.?\b/gi, 'bpo')
   .replace(/\b(?:o\.?\s*m\.?|oh[\s-]*em|ohm|peo|p\.\s*o\.?)\b/gi, 'om');
-const isFreshStart = (text) => { const t = normCmd(text); return BARE_START_RE.test(t) || NEWBPO_RE.test(t) || NEWOM_RE.test(t); };
-// Which doc type a fresh-start phrase implies: explicit OM triggers -> 'om', everything else -> 'bpo'
-// (bare "/new" defaults to bpo, matching the bare-start intake injection below).
-const freshDocType = (text) => NEWOM_RE.test(normCmd(text)) ? 'om' : 'bpo';
+const isFreshStart = (text) => { const t = normCmd(text); return BARE_START_RE.test(t) || NEWBPO_RE.test(t) || NEWOM_RE.test(t) || NEWFLYER_RE.test(t); };
+// Which doc type a fresh-start phrase implies: explicit FLYER/OM triggers win, everything else ->
+// 'bpo' (bare "/new" defaults to bpo, matching the bare-start intake injection below). Flyer is
+// checked FIRST — it's the most specific word and never collides with the om/bpo folds.
+const freshDocType = (text) => { const t = normCmd(text); return (NEWFLYER_RE.test(t) || /^\s*\/?flyer\s*$/i.test(t)) ? 'flyer' : NEWOM_RE.test(t) ? 'om' : 'bpo'; };
 const END_RE = /^\s*\/?(cancel|done|reset|stop)\b/i;
 const RETRY_RE = /^\s*\/?(retry|resend|try\s*again|again|yes|yep|yeah|yup|ok(ay)?|sure|go|please)\b/i; // after a failed generation
 
 // Explicit "make the BPO now" intent -> acknowledge the BUILD immediately (don't wait ~1 min for
 // the agent to decide). Deliberately narrow (clear generate verbs) to avoid firing on plain confirms.
-const GENERATE_INTENT_RE = /\b(generate|build|create|produce|finali[sz]e)\b[^.!?]*\b(bpo|om|report|pdf|it|this|that)\b|^\s*\/?(generate|build\s*it|make\s*it|create\s*it|generate\s+(the\s+)?(bpo|om)|build\s+(the\s+)?(bpo|om)|make\s+(the\s+)?(bpo|om)|run\s*it|send\s*it|go\s*for\s*it|let'?s\s*go|fire\s*away)\s*$/i;
+const GENERATE_INTENT_RE = /\b(generate|build|create|produce|finali[sz]e)\b[^.!?]*\b(bpo|om|flyer|report|pdf|it|this|that)\b|^\s*\/?(generate|build\s*it|make\s*it|create\s*it|generate\s+(the\s+)?(bpo|om|flyer)|build\s+(the\s+)?(bpo|om|flyer)|make\s+(the\s+)?(bpo|om|flyer)|run\s*it|send\s*it|go\s*for\s*it|let'?s\s*go|fire\s*away)\s*$/i;
 
 // STATUS check-in ("you there?", "where's my PDF", "any update", "done yet?") -> answer with
 // real status, not a generic ack.
@@ -303,6 +307,21 @@ async function sbPatch(chatId, fields) {
 // (financial vision vs comp parser) and word acks correctly BEFORE the GENERATE_* signal fires.
 // Degrades to null (PATCH no-ops) until the `active_doc_type` column exists — see DEPLOY notes.
 const sbSetDocType = (chatId, docType) => sbPatch(chatId, { active_doc_type: docType });
+// Org lookup for firm-level bots (Orion model): ONE bot token for the whole firm, stored on the
+// orgs row. Returns the org row (brand_config, logo_url, firm identity) or null — solo brokers
+// like Jessie keep their token on the brokers row and fall through unchanged. Cached per instance.
+let _orgCache;
+async function sbGetOrgByToken(botToken) {
+  if (_orgCache !== undefined) return _orgCache;
+  if (!sbConfigured() || !botToken) return (_orgCache = null);
+  try {
+    const r = await fetch(`${SB_URL}/rest/v1/orgs?telegram_bot_token=eq.${encodeURIComponent(botToken)}&active=eq.true&select=*&limit=1`, { headers: sbHeaders() });
+    if (!r.ok) return (_orgCache = null); // table missing / RLS — degrade to defaults downstream
+    const rows = await r.json();
+    _orgCache = Array.isArray(rows) && rows.length ? rows[0] : null;
+  } catch { _orgCache = null; }
+  return _orgCache;
+}
 async function sbGetDocType(chatId) { const row = await sbGet(chatId); return row ? (row.active_doc_type || null) : null; }
 const sbMarkGenerating = (chatId, payload) => sbPatch(chatId, { status: 'generating', generating_since: new Date().toISOString(), last_payload: payload });
 const sbMarkFailed = (chatId) => sbPatch(chatId, { status: 'generate_failed', generating_since: null }); // keep last_payload for retry
@@ -555,7 +574,7 @@ const sendTurn = (sessionId, text, deadlineMs) => sendTurnContent(sessionId, [{ 
 
 // ---- generate signal + PDF delivery ----
 function extractGenerate(reply) {
-  if (!/GENERATE_(?:BPO|OM)/.test(reply)) return null;  // OM payloads carry doc_type:"om"; the endpoint routes
+  if (!/GENERATE_(?:BPO|OM|FLYER)/.test(reply)) return null;  // OM/FLYER payloads carry doc_type; the endpoint routes
   const fenced = reply.match(/```(?:json|JSON)?\s*(\{[\s\S]*?\})\s*```/);
   const jtxt = fenced ? fenced[1] : (reply.match(/\{[\s\S]*\}/) || [])[0];
   if (!jtxt) return null;
@@ -593,17 +612,28 @@ async function generatePdf(payload) {
 // Bridge owns ALL "building / sent / failed" messaging, driven by real results. The agent
 // never speaks to delivery. On failure we keep the stashed payload so a retry can re-run.
 async function runGeneration(token, chatId, payload, opts = {}) {
-  const isOm = payload && payload.doc_type === 'om';       // BPO vs OM delivery wording/filename
-  const DOC = isOm ? 'OM' : 'BPO';
+  const docType = (payload && payload.doc_type) || 'bpo';  // delivery wording/filename per doc type
+  const isOm = docType === 'om';
+  const isFlyer = docType === 'flyer';
+  const DOC = isFlyer ? 'flyer' : isOm ? 'OM' : 'BPO';
+  // Firm flyers render with the org's brand row (color/logo/roster); attach it once here so the
+  // PDF endpoint stays Supabase-free. Missing org row -> endpoint falls back to Orion defaults.
+  if (isFlyer && !payload.org) {
+    const org = await sbGetOrgByToken(token);
+    if (org) payload.org = org;
+  }
   await sbMarkGenerating(chatId, payload);                 // stash payload + extend the turn lock
   if (!opts.ackedBuilding) await sendMessage(token, chatId, `Building your ${DOC} now ⏳`); // skip if already acked on generate-intent
   const result = await generatePdf(payload);
 
   if (result.ok) {
-    const addr = isOm
-      ? ((payload.property && (payload.property.name || payload.property.address_line1)) || 'OM')
-      : ((payload.subject && payload.subject.address_line1) || 'BPO');
-    const fname = `Eagen_${DOC}_${String(addr).replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '')}.pdf`;
+    const addr = isFlyer
+      ? (payload.property_name || payload.address || 'Property')
+      : isOm
+        ? ((payload.property && (payload.property.name || payload.property.address_line1)) || 'OM')
+        : ((payload.subject && payload.subject.address_line1) || 'BPO');
+    const seed = String(addr).replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    const fname = isFlyer ? `${seed}-Flyer.pdf` : `Eagen_${DOC}_${seed}.pdf`;
     if (await sendDocument(token, chatId, result.bytes, fname)) {  // attach FIRST
       await sendMessage(token, chatId, `✅ Your ${DOC} is ready. Spot an error? Tell me the fix and I’ll update it — or say “new ${DOC}” to start another.`);
       await sbMarkDelivered(chatId);                               // keep the session for post-delivery edits
@@ -652,7 +682,7 @@ async function runTurn(token, chatId, incoming, ctx) {
   // Generate-intent: lock is held and we will run the turn -> acknowledge the BUILD immediately.
   if (genIntent && !buildAcked) {
     const dt = freshDoc || await sbGetDocType(chatId);
-    await sendMessage(token, chatId, `Got it — building your ${dt === 'om' ? 'OM' : 'BPO'} now ⏳`);
+    await sendMessage(token, chatId, `Got it — building your ${dt === 'om' ? 'OM' : dt === 'flyer' ? 'flyer' : 'BPO'} now ⏳`);
     buildAcked = true;
   }
 
@@ -687,8 +717,10 @@ async function runTurn(token, chatId, incoming, ctx) {
     sessionId = row.session_id;
   }
 
-  // Bare start command ("/start", "/new", "BPO") -> kick the agent's intake; otherwise pass through.
-  const toSend = BARE_START_RE.test(normCmd(incoming)) ? 'Hi, I need to start a new BPO.' : incoming;
+  // Bare start command ("/start", "/new", "BPO", "flyer") -> kick the agent's intake; otherwise pass through.
+  const toSend = BARE_START_RE.test(normCmd(incoming))
+    ? `Hi, I need to start a new ${freshDoc === 'flyer' ? 'flyer' : freshDoc === 'om' ? 'OM' : 'BPO'}.`
+    : incoming;
 
   const deadline = Date.now() + 200000;
   let reply;
@@ -715,7 +747,7 @@ async function runTurn(token, chatId, incoming, ctx) {
     // payload is byte-identical to what we last built, nothing changed — say so instead of falsely
     // running "Building…/ready" on an unchanged rebuild.
     if (editingDelivered && row && row.last_payload && payloadsEqual(payload, row.last_payload)) {
-      const docLabel = payload.doc_type === 'om' ? 'OM' : 'BPO';
+      const docLabel = payload.doc_type === 'om' ? 'OM' : payload.doc_type === 'flyer' ? 'flyer' : 'BPO';
       await sbTouch(chatId);
       await sendMessage(token, chatId, `That's already in the ${docLabel} as it stands — nothing changed in the document. If you want a specific edit, tell me exactly what to change (e.g. a different value, or "add it as a separate page/section").`);
       return;
@@ -725,7 +757,7 @@ async function runTurn(token, chatId, incoming, ctx) {
   }
 
   await sbTouch(chatId);
-  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM)\s*/i, '').trim() || reply);
+  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM|FLYER)\s*/i, '').trim() || reply);
 }
 
 // An xlsx arrived: download -> parse -> inject parsed tenants into the chat's session so the
@@ -819,7 +851,7 @@ async function injectCompsAndReply(token, chatId, comps) {
   const payload = extractGenerate(reply);
   if (payload) { await runGeneration(token, chatId, payload); return; }
   await sbTouch(chatId);
-  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM)\s*/i, '').trim() || reply);
+  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM|FLYER)\s*/i, '').trim() || reply);
 }
 
 // A comp PDF arrived: download -> parse-comp-pdf -> upload the extracted photo to Supabase ->
@@ -933,7 +965,7 @@ async function handleFinancialPdf(token, chatId, doc) {
     const payload = extractGenerate(reply);
     if (payload) { await runGeneration(token, chatId, payload); return; }
     await sbTouch(chatId);
-    await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM)\s*/i, '').trim() || reply);
+    await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM|FLYER)\s*/i, '').trim() || reply);
 
   } catch (e) {
     console.error('handleFinancialPdf error:', (e && e.message) || e);
@@ -1050,8 +1082,16 @@ async function injectPhotosAndReply(token, chatId, urls) {
   // (subject.photo_urls[]). Route the injection by the session's active_doc_type so OM photos land in
   // the right fields instead of silently vanishing. BPO branch is unchanged.
   const isOm = !!(row && row.active_doc_type === 'om');
-  await sendMessage(token, chatId, many ? `Got your ${n} photos — I’ll place them across the ${isOm ? 'OM' : 'BPO'}.` : 'Got the property photo.');
-  const injection = isOm
+  const isFlyer = !!(row && row.active_doc_type === 'flyer');
+  await sendMessage(token, chatId, many ? `Got your ${n} photos — I’ll place them across the ${isOm ? 'OM' : isFlyer ? 'flyer' : 'BPO'}.` : 'Got the property photo.');
+  const injection = isFlyer
+    ? `[The broker sent ${n} photo${many ? 's together (a batch)' : ''} for the FLYER. Public URL${many ? 's IN ORDER' : ''}:\n${urls.join('\n')}\n` +
+      `FLYER PHOTO RULES:\n` +
+      `- APPEND ${many ? 'these URLs' : 'this URL'} to the payload's "photos" ORDERED array; never drop earlier photos.\n` +
+      `- Slot order (fill sequentially): [0] exterior/aerial hero (page 1), [1] interior (page 1), [2] large aerial/parking (page 3 top), [3]-[5] interior details (page 3 row), [6] interior office (page 2).\n` +
+      `- If the broker says one of these is the FLOOR PLAN, put that URL in "floor_plan_url" instead of "photos". If they say one is the amenities map, put it in "amenities_map_url".\n` +
+      `- The broker was ALREADY told the count. Do NOT re-list or re-count the photos — acknowledge in at most one short line (or nothing) and continue the flyer intake flow.]`
+    : isOm
     ? `[The broker sent ${n} property photo${many ? 's together (a batch)' : ''} for the OM. Public URL${many ? 's IN ORDER' : ''}:\n${urls.join('\n')}\n` +
       `OM PHOTO RULES:\n` +
       `- The FIRST photo ever received across ALL batches goes into photos.cover_url (the cover hero). If photos.cover_url is already set, do NOT replace it.\n` +
@@ -1071,7 +1111,7 @@ async function injectPhotosAndReply(token, chatId, urls) {
   const payload = extractGenerate(reply);
   if (payload) { await runGeneration(token, chatId, payload); return; }
   await sbTouch(chatId);
-  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM)\s*/i, '').trim() || reply);
+  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM|FLYER)\s*/i, '').trim() || reply);
 }
 
 // A PHOTO arrived: grab bytes (tg-7), store in the bucket, append it to the batch buffer; the settler
