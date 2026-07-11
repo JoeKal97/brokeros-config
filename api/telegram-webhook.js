@@ -309,19 +309,27 @@ async function sbPatch(chatId, fields) {
 const sbSetDocType = (chatId, docType) => sbPatch(chatId, { active_doc_type: docType });
 // Org lookup for firm-level bots (Orion model): ONE bot token for the whole firm, stored on the
 // orgs row. Returns the org row (brand_config, logo_url, firm identity) or null — solo brokers
-// like Jessie keep their token on the brokers row and fall through unchanged. Cached per instance.
-let _orgCache;
-async function sbGetOrgByToken(botToken) {
-  if (_orgCache !== undefined) return _orgCache;
-  if (!sbConfigured() || !botToken) return (_orgCache = null);
-  try {
-    const r = await fetch(`${SB_URL}/rest/v1/orgs?telegram_bot_token=eq.${encodeURIComponent(botToken)}&active=eq.true&select=*&limit=1`, { headers: sbHeaders() });
-    if (!r.ok) return (_orgCache = null); // table missing / RLS — degrade to defaults downstream
-    const rows = await r.json();
-    _orgCache = Array.isArray(rows) && rows.length ? rows[0] : null;
-  } catch { _orgCache = null; }
-  return _orgCache;
+// like Jessie keep their token on the brokers row and fall through unchanged. Cache is keyed by
+// the lookup filter: one warm instance serves BOTH the solo bot and firm bots without poisoning.
+const _orgCache = new Map();
+async function sbOrgLookup(filter) {
+  if (_orgCache.has(filter)) return _orgCache.get(filter);
+  let org = null;
+  if (sbConfigured()) {
+    try {
+      const r = await fetch(`${SB_URL}/rest/v1/orgs?${filter}&active=eq.true&select=*&limit=1`, { headers: sbHeaders() });
+      if (r.ok) { const rows = await r.json(); org = Array.isArray(rows) && rows.length ? rows[0] : null; }
+      // !r.ok (table missing / RLS) — degrade to defaults downstream
+    } catch { /* degrade to defaults downstream */ }
+  }
+  _orgCache.set(filter, org);
+  return org;
 }
+const sbGetOrgByToken = (botToken) => botToken ? sbOrgLookup(`telegram_bot_token=eq.${encodeURIComponent(botToken)}`) : Promise.resolve(null);
+// Telegram updates carry NO bot identity, so firm bots register their webhook URL with
+// ?bot_id=<numeric bot id>. Match on the token's "<botid>:" prefix — the full secret never
+// appears in a URL (URLs land in access logs).
+const sbGetOrgByBotId = (botId) => sbOrgLookup(`telegram_bot_token=like.${encodeURIComponent(botId + ':*')}`);
 async function sbGetDocType(chatId) { const row = await sbGet(chatId); return row ? (row.active_doc_type || null) : null; }
 const sbMarkGenerating = (chatId, payload) => sbPatch(chatId, { status: 'generating', generating_since: new Date().toISOString(), last_payload: payload });
 const sbMarkFailed = (chatId) => sbPatch(chatId, { status: 'generate_failed', generating_since: null }); // keep last_payload for retry
@@ -1257,6 +1265,19 @@ export default async function handler(req, res) {
     }
     return res.status(200).json(out);
   }
+  // Firm-bot routing self-test (GET ?selftest=org&bot_id=NNN): resolves the orgs row exactly the
+  // way the POST path does. Reports org_name + the token's bot-id prefix only — never the secret.
+  if (req.method === 'GET' && req.query && req.query.selftest === 'org') {
+    const botId = String(req.query.bot_id || '').trim();
+    if (!/^\d+$/.test(botId)) return res.status(200).json({ selftest: 'org', ok: false, reason: 'pass ?bot_id=<numeric telegram bot id>' });
+    const org = await sbGetOrgByBotId(botId);
+    return res.status(200).json({
+      selftest: 'org', ok: !!org,
+      org_name: org ? org.org_name : null,
+      token_bot_id: org && org.telegram_bot_token ? String(org.telegram_bot_token).split(':')[0] : null,
+      token_len: org && org.telegram_bot_token ? String(org.telegram_bot_token).length : 0,
+    });
+  }
   // Confirm OPENAI_API_KEY is readable by the function (presence/length only, never the value) so a
   // voice-in phone test won't silently fail on a missing/mis-named env var.
   if (req.method === 'GET' && req.query && req.query.selftest === 'whisper') {
@@ -1268,7 +1289,16 @@ export default async function handler(req, res) {
   }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const token = process.env.TELEGRAM_BOT_TOKEN;
+  // MULTI-BOT ROUTING: a Telegram update contains no bot identity — routing is by webhook URL.
+  // Firm bots (Orion) register with ?bot_id=<numeric id>; we resolve their orgs row and use ITS
+  // token for every reply this request. No bot_id -> solo default (Jessie's env token), unchanged.
+  let token = process.env.TELEGRAM_BOT_TOKEN;
+  const botId = String((req.query && req.query.bot_id) || '').trim();
+  if (/^\d+$/.test(botId)) {
+    const org = await sbGetOrgByBotId(botId);
+    if (org && org.telegram_bot_token) token = org.telegram_bot_token;
+    else console.error(`bot_id ${botId} matched no active orgs row — replying via solo default token`);
+  }
 
   let update = req.body;
   if (typeof update === 'string') { try { update = JSON.parse(update); } catch { update = {}; } }
