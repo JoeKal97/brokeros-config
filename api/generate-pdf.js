@@ -1037,7 +1037,7 @@ function buildFlyerVars(payload, org) {
 // any failure -> [] -> the page-4 grid renders empty, exactly as before this feature.
 const FLYER_PLACE_TYPE_GROUPS = [
   ['restaurant', 'cafe', 'bakery', 'coffee_shop'],               // food + coffee
-  ['bar', 'wine_bar', 'liquor_store', 'night_club'],             // drink/wine (breweries surface as bar/restaurant)
+  ['bar', 'wine_bar', 'liquor_store'],                           // drink/wine (breweries surface as bar/restaurant; no night_club — adult venues qualify)
   ['gym'],                                                       // fitness
   ['clothing_store', 'gift_shop', 'book_store', 'art_gallery'],  // specialty retail only — no generic 'store'
 ];
