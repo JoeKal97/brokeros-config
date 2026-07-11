@@ -1106,12 +1106,13 @@ async function injectPhotosAndReply(token, chatId, urls) {
   const isFlyer = !!(row && row.active_doc_type === 'flyer');
   await sendMessage(token, chatId, many ? `Got your ${n} photos — I’ll place them across the ${isOm ? 'OM' : isFlyer ? 'flyer' : 'BPO'}.` : 'Got the property photo.');
   const injection = isFlyer
-    ? `[The broker sent ${n} photo${many ? 's together (a batch)' : ''} for the FLYER. Public URL${many ? 's IN ORDER' : ''}:\n${urls.join('\n')}\n` +
+    ? `[The broker sent ${n} photo${many ? 's together (a batch)' : ''} for the FLYER. Public URL${many ? 's, numbered in upload order' : ''}:\n${urls.map((u, i) => `${i + 1}. ${u}`).join('\n')}\n` +
       `FLYER PHOTO RULES:\n` +
-      `- APPEND ${many ? 'these URLs' : 'this URL'} to the payload's "photos" ORDERED array; never drop earlier photos.\n` +
-      `- Slot order (fill sequentially): [0] exterior/aerial hero (page 1), [1] interior (page 1), [2] large aerial/parking (page 3 top), [3]-[5] interior details (page 3 row), [6] interior office (page 2).\n` +
-      `- If the broker says one of these is the FLOOR PLAN, put that URL in "floor_plan_url" instead of "photos". If they say one is the amenities map, put it in "amenities_map_url".\n` +
-      `- The broker was ALREADY told the count. Do NOT re-list or re-count the photos — acknowledge in at most one short line (or nothing) and continue the flyer intake flow.]`
+      `- Do NOT guess which slot a photo belongs to — upload order means nothing.\n` +
+      `- ASK the broker to label them in ONE short question, by number (skip labels already assigned in this session and labels the broker says they don't have): which is the FLOOR PLAN, the main EXTERIOR/HERO shot (page 1), the page-1 INTERIOR, the full-width AERIAL/PARKING shot (page 3), the page-2 OFFICE interior, and which (up to 3) are the small page-3 DETAIL shots.\n` +
+      `- Place each URL into the labeled payload fields per their answer: photos.hero_url, photos.interior_url, photos.aerial_url, photos.detail_urls (array, max 3), photos.office_url, floor_plan_url, amenities_map_url. "photos" is an OBJECT with these keys, not an array.\n` +
+      `- Keep labels assigned earlier in the session; never drop previously placed photos.\n` +
+      `- The broker was ALREADY told the count. Do not re-list URLs — refer to photos by their numbers.]`
     : isOm
     ? `[The broker sent ${n} property photo${many ? 's together (a batch)' : ''} for the OM. Public URL${many ? 's IN ORDER' : ''}:\n${urls.join('\n')}\n` +
       `OM PHOTO RULES:\n` +
@@ -1298,7 +1299,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ selftest: 'whisper', key_present: !!k, key_len: k.length });
   }
   if (req.method === 'GET' || (req.query && req.query.version !== undefined)) {
-    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 4 });
+    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 5 });
   }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 

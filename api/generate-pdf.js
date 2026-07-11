@@ -996,7 +996,18 @@ function buildFlyerVars(payload, org) {
     `<div class="ftr-p${i === 0 ? ' ftr-p-first' : ''}"><span class="n">${esc(b.name)}</span>${esc(b.phone || '')}<br><a href="mailto:${esc(b.email || '')}">${esc(b.email || '')}</a></div>`
   ).join('\n      ');
 
-  const photos = Array.isArray(payload.photos) ? payload.photos : [];
+  // Photo slots: labeled object (preferred — the agent asks the broker which photo is which)
+  // with the legacy positional array still accepted for old payloads.
+  const rawP = payload.photos;
+  const ph = { hero: null, interior: null, aerial: null, details: [], office: null };
+  if (Array.isArray(rawP)) {
+    ph.hero = rawP[0]; ph.interior = rawP[1]; ph.aerial = rawP[2];
+    ph.details = rawP.slice(3, 6); ph.office = rawP[6];
+  } else if (rawP && typeof rawP === 'object') {
+    ph.hero = rawP.hero_url; ph.interior = rawP.interior_url; ph.aerial = rawP.aerial_url;
+    ph.details = Array.isArray(rawP.detail_urls) ? rawP.detail_urls.slice(0, 3) : [];
+    ph.office = rawP.office_url;
+  }
   const caps = Array.isArray(payload.photo_captions) ? payload.photo_captions : [];
   const website = (org && org.firm_website) || FLYER_FIRM_DEFAULTS.firm_website;
 
@@ -1005,21 +1016,21 @@ function buildFlyerVars(payload, org) {
     FIRM_NAME: esc(firmName),
     HDR_SUB: hdrSub,
     ADDRESS: esc(payload.address || ''),
-    PHOTO_HERO: flyerPhoto(photos[0], '📷', 'Exterior / Aerial Hero Photo'),
+    PHOTO_HERO: flyerPhoto(ph.hero, '📷', 'Exterior / Aerial Hero Photo'),
     BUILDING_HIGHLIGHTS: liList(payload.building_highlights),
-    PHOTO_P1_SIDE: flyerPhoto(photos[1], '🏢', 'Interior / Aerial Photo', 'height:100%'),
+    PHOTO_P1_SIDE: flyerPhoto(ph.interior, '🏢', 'Interior / Aerial Photo', 'height:100%'),
     PHOTO_FLOORPLAN: flyerPhoto(payload.floor_plan_url, '📐', 'Floor Plan', 'flex:1; min-height:0'),
     CALLOUTS: callouts,
-    PHOTO_P2_INTERIOR: flyerPhoto(photos[6], '📷', 'Interior Office Photo', 'height:2.8in; flex-shrink:0; margin-bottom:6px'),
+    PHOTO_P2_INTERIOR: flyerPhoto(ph.office, '📷', 'Interior Office Photo', 'height:2.8in; flex-shrink:0; margin-bottom:6px'),
     SPACE_HIGHLIGHTS: availRow + liList(spaceItems),
     RATE_CTA: esc(payload.lease_rate || 'Call Broker for Rates'),
     FIRM_LEGAL: esc((org && org.firm_legal) || FLYER_FIRM_DEFAULTS.firm_legal),
-    PHOTO_P3_TOP: flyerPhoto(photos[2], '📷', 'Aerial / Parking Photo — Full Width', 'height:100%'),
-    PHOTO_P3_A: flyerPhoto(photos[3], '📷', caps[0] || 'Multipurpose Room'),
+    PHOTO_P3_TOP: flyerPhoto(ph.aerial, '📷', 'Aerial / Parking Photo — Full Width', 'height:100%'),
+    PHOTO_P3_A: flyerPhoto(ph.details[0], '📷', caps[0] || 'Multipurpose Room'),
     P3_CAP_A: esc(caps[0] || 'Multipurpose Rooms'),
-    PHOTO_P3_B: flyerPhoto(photos[4], '📷', caps[1] || 'Reception / Waiting Area'),
+    PHOTO_P3_B: flyerPhoto(ph.details[1], '📷', caps[1] || 'Reception / Waiting Area'),
     P3_CAP_B: esc(caps[1] || 'Reception / Waiting Area'),
-    PHOTO_P3_C: flyerPhoto(photos[5], '📷', caps[2] || 'Conference Room'),
+    PHOTO_P3_C: flyerPhoto(ph.details[2], '📷', caps[2] || 'Conference Room'),
     P3_CAP_C: esc(caps[2] || 'Conference Room'),
     PHOTO_AMENITIES_MAP: flyerPhoto(payload.amenities_map_url, '🗺️', 'Amenities Map — ' + (payload.address || 'Nearby'), 'flex:1; min-height:0'),
     AMENITY_ITEMS: amenities,
@@ -1044,10 +1055,9 @@ const FLYER_PLACE_TYPE_GROUPS = [
 // Belt-and-suspenders: a place carrying any of these types is dropped even when it also carries
 // an included type (keeps tire centers / shippers out of a leasing flyer's amenity grid).
 const FLYER_PLACE_EXCLUDED_TYPES = ['hardware_store', 'car_repair', 'auto_parts_store', 'car_dealer', 'gas_station', 'supermarket', 'courier_service'];
-async function flyerNearbyAmenities(address, key) {
-  if (!address || !key) return [];
-  const loc = parseLoc(await geocode(address, key));
-  if (!loc) return [];
+async function flyerNearbyAmenities(centerLoc, key) {
+  const loc = parseLoc(centerLoc);
+  if (!loc || !key) return { names: [], points: [] };
   const seen = new Set();
   const found = [];
   for (const includedTypes of FLYER_PLACE_TYPE_GROUPS) {
@@ -1057,7 +1067,7 @@ async function flyerNearbyAmenities(address, key) {
         headers: {
           'Content-Type': 'application/json',
           'X-Goog-Api-Key': key,
-          'X-Goog-FieldMask': 'places.displayName,places.userRatingCount',
+          'X-Goog-FieldMask': 'places.displayName,places.userRatingCount,places.location',
         },
         body: JSON.stringify({
           includedTypes,
@@ -1073,13 +1083,27 @@ async function flyerNearbyAmenities(address, key) {
         const name = p.displayName && p.displayName.text;
         if (!name || seen.has(name.toLowerCase())) continue;
         seen.add(name.toLowerCase());
-        found.push({ name, n: p.userRatingCount || 0 });
+        found.push({ name, n: p.userRatingCount || 0, loc: p.location ? `${p.location.latitude},${p.location.longitude}` : null });
       }
     } catch (e) { console.error('places group failed:', (e && e.message) || e); }
   }
   // Review volume ~ local prominence; mirrors the hand-picked feel of Orion's own list.
   found.sort((a, b) => b.n - a.n);
-  return found.slice(0, 32).map((p) => p.name);
+  const top = found.slice(0, 32);
+  return { names: top.map((p) => p.name), points: top.map((p) => p.loc).filter(Boolean) };
+}
+
+// Page-4 amenities map via Static Maps (same helper/key as the BPO maps): property pin in brand
+// orange, amenity dots in body gray, framed to fit everything. Returns a data URI or null.
+async function flyerAmenitiesMap(centerLoc, points, key) {
+  if (!centerLoc || !key) return null;
+  const params = ['size=640x420', 'scale=2', 'maptype=roadmap'];
+  const fit = points.length ? fitVisible([centerLoc, ...points]) : null;
+  if (fit) params.push(fit);
+  else params.push(`center=${encodeURIComponent(centerLoc)}`, 'zoom=15');
+  if (points.length) params.push(`markers=${encodeURIComponent('size:small|color:0x3a3a3a|' + points.join('|'))}`);
+  params.push(mk('0xD9591B', '', centerLoc)); // property pin
+  return staticMap(params, key);
 }
 
 async function assembleFlyer(payload, org) {
@@ -1089,9 +1113,17 @@ async function assembleFlyer(payload, org) {
     if (!r.ok) throw new Error('Flyer template fetch failed: HTTP ' + r.status);
     tpl = await r.text();
   }
+  // Geocode ONCE; feeds both the auto-amenities search and the page-4 map.
+  const gKey = process.env.GOOGLE_MAPS_API_KEY;
+  const centerLoc = gKey ? await geocode(payload.address, gKey) : null;
+  let amenityPoints = [];
   if (!(Array.isArray(payload.amenities) && payload.amenities.length)) {
-    const auto = await flyerNearbyAmenities(payload.address, process.env.GOOGLE_MAPS_API_KEY);
-    if (auto.length) payload = { ...payload, amenities: auto };
+    const auto = await flyerNearbyAmenities(centerLoc, gKey);
+    if (auto.names.length) { payload = { ...payload, amenities: auto.names }; amenityPoints = auto.points; }
+  }
+  if (!payload.amenities_map_url && centerLoc) {
+    const mapUri = await flyerAmenitiesMap(centerLoc, amenityPoints, gKey);
+    if (mapUri) payload = { ...payload, amenities_map_url: mapUri };
   }
   let source = fillTemplate(tpl, buildFlyerVars(payload, org));
   // Brand overrides from the org row: accent color swap + hosted logo (template default is Orion).

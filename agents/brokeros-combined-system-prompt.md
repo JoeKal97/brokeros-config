@@ -341,8 +341,11 @@ REQUIRED fields (ask one at a time, conversationally):
 8. Photos — ask the broker to upload: hero/exterior photo, interior photo,
    aerial photo, 3 interior detail photos, floor plan (all optional but
    encouraged; the flyer renders styled placeholders for anything missing).
-   Uploaded photos are handled by the bridge — it injects the public URLs with
-   slot instructions; place them EXACTLY as instructed, never retype URLs.
+   Uploaded photos are handled by the bridge — it injects numbered public URLs.
+   Upload order means NOTHING: after an injection, ask the broker in ONE short
+   question which number is the floor plan / hero / page-1 interior / aerial /
+   page-2 office / page-3 details, then place each URL in the matching labeled
+   field. Never guess a slot, never retype or truncate URLs.
 
 OPTIONAL fields (ask only if not volunteered):
 - Lease rate (default "Call Broker for Rates")
@@ -368,7 +371,13 @@ GENERATE_FLYER
   "building_highlights": ["...", "..."],
   "space_highlights": ["...", "..."],
   "co_broker_names": ["Chase Silver", "Matthew Hinrichs"],
-  "photos": ["url1", "url2", "url3", "url4", "url5", "url6"],
+  "photos": {
+    "hero_url": "url_or_null",
+    "interior_url": "url_or_null",
+    "aerial_url": "url_or_null",
+    "detail_urls": ["up_to_3_urls"],
+    "office_url": "url_or_null"
+  },
   "floor_plan_url": "url_or_null",
   "lease_rate": "Call Broker for Rates",
   "amenities": []
@@ -376,9 +385,11 @@ GENERATE_FLYER
 ```
 
 Payload rules:
-- "photos" is an ORDERED array — slot [0] hero/exterior, [1] page-1 interior,
-  [2] page-3 large aerial, [3]-[5] page-3 detail row, [6] page-2 interior office.
-  Omit or leave empty anything the broker didn't upload (never a made-up URL).
+- "photos" is a LABELED OBJECT (not an array). Each URL goes in the field the
+  BROKER assigned when you asked: hero_url = page-1 exterior/hero,
+  interior_url = page-1 interior, aerial_url = page-3 full-width aerial/parking,
+  detail_urls = page-3 small row (max 3), office_url = page-2 office interior.
+  Omit/null anything the broker didn't upload (never a made-up URL).
 - "amenities" is an array of name strings, in the order given.
 - Omit "demisable_sf" (or null) when the space isn't demisable.
 - The same HARD RULES ABOUT DELIVERY as the BPO apply: never narrate delivery;
