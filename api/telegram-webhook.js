@@ -714,9 +714,11 @@ async function runTurn(token, chatId, incoming, ctx) {
   const editingDelivered = !wantStart && row && row.status === 'delivered' && row.session_id;
 
   let sessionId;
+  let isNewSession = false;
   if (wantStart || !row) {              // START: fresh session, wiped clean
     const s = await newSession();
     sessionId = s.id;
+    isNewSession = true;
     await sbUpsert(chatId, sessionId, s.envId);
     await sbClearState(chatId);
     await sbSetDocType(chatId, freshDoc || 'bpo'); // tag OM vs BPO so PDF routing + acks know the doc type
@@ -726,9 +728,18 @@ async function runTurn(token, chatId, incoming, ctx) {
   }
 
   // Bare start command ("/start", "/new", "BPO", "flyer") -> kick the agent's intake; otherwise pass through.
-  const toSend = BARE_START_RE.test(normCmd(incoming))
+  let toSend = BARE_START_RE.test(normCmd(incoming))
     ? `Hi, I need to start a new ${freshDoc === 'flyer' ? 'flyer' : freshDoc === 'om' ? 'OM' : 'BPO'}.`
     : incoming;
+
+  // IDENTITY TAG (first turn of every new session): tells the agent WHO it is. Firm bots (token
+  // resolved from an orgs row) get a neutral no-name persona; solo (no org row) stays Jessie —
+  // the agent's default when no tag is present, so solo behavior is unchanged either way.
+  const org = await sbGetOrgByToken(token); // Map-cached per instance; null for the solo bot
+  const idTag = org
+    ? `[BOT IDENTITY: firm — ${org.org_name}. Shared firm bot: greet neutrally and briefly, never use a personal broker name, never present yourself as Jessie or Eagen Real Estate. Supported doc types: ${((org.brand_config && org.brand_config.doc_types) || ['flyer']).join(', ')}.]\n`
+    : '';
+  if (isNewSession && idTag) toSend = idTag + toSend;
 
   const deadline = Date.now() + 200000;
   let reply;
@@ -742,6 +753,8 @@ async function runTurn(token, chatId, incoming, ctx) {
     const s = await newSession();
     sessionId = s.id;
     await sbUpsert(chatId, sessionId, s.envId);
+    // Recreated session = a NEW session: re-apply the identity tag if it isn't already on the turn.
+    if (idTag && !toSend.startsWith('[BOT IDENTITY')) toSend = idTag + toSend;
     reply = await sendTurn(sessionId, toSend, deadline);
   }
 
@@ -1285,7 +1298,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ selftest: 'whisper', key_present: !!k, key_len: k.length });
   }
   if (req.method === 'GET' || (req.query && req.query.version !== undefined)) {
-    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 3 });
+    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 4 });
   }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
