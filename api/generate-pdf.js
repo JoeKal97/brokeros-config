@@ -1036,11 +1036,14 @@ function buildFlyerVars(payload, org) {
 // also be enabled on it in Google Cloud Console or every group request 403s. Fully graceful:
 // any failure -> [] -> the page-4 grid renders empty, exactly as before this feature.
 const FLYER_PLACE_TYPE_GROUPS = [
-  ['restaurant', 'cafe', 'bakery'],          // food
-  ['bar', 'night_club'],                     // drink (breweries surface as bar/restaurant)
-  ['gym'],                                   // fitness
-  ['store', 'shopping_mall', 'supermarket'], // retail
+  ['restaurant', 'cafe', 'bakery', 'coffee_shop'],               // food + coffee
+  ['bar', 'wine_bar', 'liquor_store', 'night_club'],             // drink/wine (breweries surface as bar/restaurant)
+  ['gym'],                                                       // fitness
+  ['clothing_store', 'gift_shop', 'book_store', 'art_gallery'],  // specialty retail only — no generic 'store'
 ];
+// Belt-and-suspenders: a place carrying any of these types is dropped even when it also carries
+// an included type (keeps tire centers / shippers out of a leasing flyer's amenity grid).
+const FLYER_PLACE_EXCLUDED_TYPES = ['hardware_store', 'car_repair', 'auto_parts_store', 'car_dealer', 'gas_station', 'supermarket', 'courier_service'];
 async function flyerNearbyAmenities(address, key) {
   if (!address || !key) return [];
   const loc = parseLoc(await geocode(address, key));
@@ -1058,6 +1061,7 @@ async function flyerNearbyAmenities(address, key) {
         },
         body: JSON.stringify({
           includedTypes,
+          excludedTypes: FLYER_PLACE_EXCLUDED_TYPES,
           maxResultCount: 20, // API max per request; 4 groups deduped -> capped at 32 below
           rankPreference: 'POPULARITY',
           locationRestriction: { circle: { center: { latitude: loc[0], longitude: loc[1] }, radius: 1600 } },
