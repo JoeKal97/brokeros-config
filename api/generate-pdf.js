@@ -981,6 +981,13 @@ function buildFlyerVars(payload, org) {
   const amenities = (Array.isArray(payload.amenities) ? payload.amenities : [])
     .map((a) => '<li>' + esc(typeof a === 'object' && a !== null ? a.name : a) + '</li>').join('');
 
+  // Page-2 checklist: the "Available Space" top row is DERIVED from available_sf/demisable_sf —
+  // never trusted from the space_highlights array (agents phrase it inconsistently). Any
+  // agent-supplied "Available Space..." item is dropped so it can't render twice.
+  const spaceItems = (Array.isArray(payload.space_highlights) ? payload.space_highlights : [])
+    .filter((h) => !/^\s*available\s+space\b/i.test(String(h)));
+  const availRow = sfLine ? '<li>Available Space:<br>' + esc(sfLine) + '</li>' : '';
+
   // Footer contacts: the brokers on THIS listing (agent collects co_broker_names); default first two.
   const names = Array.isArray(payload.co_broker_names) ? payload.co_broker_names : [];
   let listing = names.length ? roster.filter((b) => names.some((n) => String(n).toLowerCase() === String(b.name).toLowerCase())) : [];
@@ -1004,7 +1011,7 @@ function buildFlyerVars(payload, org) {
     PHOTO_FLOORPLAN: flyerPhoto(payload.floor_plan_url, '📐', 'Floor Plan', 'flex:1; min-height:0'),
     CALLOUTS: callouts,
     PHOTO_P2_INTERIOR: flyerPhoto(photos[6], '📷', 'Interior Office Photo', 'height:2.8in; flex-shrink:0; margin-bottom:6px'),
-    SPACE_HIGHLIGHTS: liList(payload.space_highlights),
+    SPACE_HIGHLIGHTS: availRow + liList(spaceItems),
     RATE_CTA: esc(payload.lease_rate || 'Call Broker for Rates'),
     FIRM_LEGAL: esc((org && org.firm_legal) || FLYER_FIRM_DEFAULTS.firm_legal),
     PHOTO_P3_TOP: flyerPhoto(photos[2], '📷', 'Aerial / Parking Photo — Full Width', 'height:100%'),
@@ -1023,12 +1030,64 @@ function buildFlyerVars(payload, org) {
   };
 }
 
+// Auto-amenities: when the payload omits amenities, pull nearby businesses from Google Places
+// (New) Nearby Search — same GOOGLE_MAPS_API_KEY as the BPO maps, and the BPO's geocode() for
+// the center point. NOTE: the key powers Geocoding + Static Maps today; Places API (New) must
+// also be enabled on it in Google Cloud Console or every group request 403s. Fully graceful:
+// any failure -> [] -> the page-4 grid renders empty, exactly as before this feature.
+const FLYER_PLACE_TYPE_GROUPS = [
+  ['restaurant', 'cafe', 'bakery'],          // food
+  ['bar', 'night_club'],                     // drink (breweries surface as bar/restaurant)
+  ['gym'],                                   // fitness
+  ['store', 'shopping_mall', 'supermarket'], // retail
+];
+async function flyerNearbyAmenities(address, key) {
+  if (!address || !key) return [];
+  const loc = parseLoc(await geocode(address, key));
+  if (!loc) return [];
+  const seen = new Set();
+  const found = [];
+  for (const includedTypes of FLYER_PLACE_TYPE_GROUPS) {
+    try {
+      const r = await fetch('https://places.googleapis.com/v1/places:searchNearby', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Goog-Api-Key': key,
+          'X-Goog-FieldMask': 'places.displayName,places.userRatingCount',
+        },
+        body: JSON.stringify({
+          includedTypes,
+          maxResultCount: 20, // API max per request; 4 groups deduped -> capped at 32 below
+          rankPreference: 'POPULARITY',
+          locationRestriction: { circle: { center: { latitude: loc[0], longitude: loc[1] }, radius: 1600 } },
+        }),
+      });
+      if (!r.ok) { console.error('places searchNearby HTTP', r.status, (await r.text()).slice(0, 200)); continue; }
+      const j = await r.json();
+      for (const p of (j.places || [])) {
+        const name = p.displayName && p.displayName.text;
+        if (!name || seen.has(name.toLowerCase())) continue;
+        seen.add(name.toLowerCase());
+        found.push({ name, n: p.userRatingCount || 0 });
+      }
+    } catch (e) { console.error('places group failed:', (e && e.message) || e); }
+  }
+  // Review volume ~ local prominence; mirrors the hand-picked feel of Orion's own list.
+  found.sort((a, b) => b.n - a.n);
+  return found.slice(0, 32).map((p) => p.name);
+}
+
 async function assembleFlyer(payload, org) {
   let tpl = loadLocalFlyerTemplate();
   if (!tpl) {
     const r = await fetch(FLYER_TEMPLATE_URL);
     if (!r.ok) throw new Error('Flyer template fetch failed: HTTP ' + r.status);
     tpl = await r.text();
+  }
+  if (!(Array.isArray(payload.amenities) && payload.amenities.length)) {
+    const auto = await flyerNearbyAmenities(payload.address, process.env.GOOGLE_MAPS_API_KEY);
+    if (auto.length) payload = { ...payload, amenities: auto };
   }
   let source = fillTemplate(tpl, buildFlyerVars(payload, org));
   // Brand overrides from the org row: accent color swap + hosted logo (template default is Orion).
