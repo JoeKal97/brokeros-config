@@ -1008,7 +1008,6 @@ function buildFlyerVars(payload, org) {
     ph.details = Array.isArray(rawP.detail_urls) ? rawP.detail_urls.slice(0, 3) : [];
     ph.office = rawP.office_url;
   }
-  const caps = Array.isArray(payload.photo_captions) ? payload.photo_captions : [];
   const website = (org && org.firm_website) || FLYER_FIRM_DEFAULTS.firm_website;
 
   return {
@@ -1026,12 +1025,11 @@ function buildFlyerVars(payload, org) {
     RATE_CTA: esc(payload.lease_rate || 'Call Broker for Rates'),
     FIRM_LEGAL: esc((org && org.firm_legal) || FLYER_FIRM_DEFAULTS.firm_legal),
     PHOTO_P3_TOP: flyerPhoto(ph.aerial, '📷', 'Aerial / Parking Photo — Full Width', 'height:100%'),
-    PHOTO_P3_A: flyerPhoto(ph.details[0], '📷', caps[0] || 'Multipurpose Room'),
-    P3_CAP_A: esc(caps[0] || 'Multipurpose Rooms'),
-    PHOTO_P3_B: flyerPhoto(ph.details[1], '📷', caps[1] || 'Reception / Waiting Area'),
-    P3_CAP_B: esc(caps[1] || 'Reception / Waiting Area'),
-    PHOTO_P3_C: flyerPhoto(ph.details[2], '📷', caps[2] || 'Conference Room'),
-    P3_CAP_C: esc(caps[2] || 'Conference Room'),
+    // No captions under the detail row (clean look, no wrong-label risk) — placeholder text
+    // inside an EMPTY slot is generic for the same reason.
+    PHOTO_P3_A: flyerPhoto(ph.details[0], '📷', 'Detail Photo 1'),
+    PHOTO_P3_B: flyerPhoto(ph.details[1], '📷', 'Detail Photo 2'),
+    PHOTO_P3_C: flyerPhoto(ph.details[2], '📷', 'Detail Photo 3'),
     PHOTO_AMENITIES_MAP: payload._amenities_map_html
       || flyerPhoto(payload.amenities_map_url, '🗺️', 'Amenities Map — ' + (payload.address || 'Nearby'), 'flex:1; min-height:0'),
     AMENITY_ITEMS: amenities,
