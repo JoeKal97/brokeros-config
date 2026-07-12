@@ -980,8 +980,13 @@ function buildFlyerVars(payload, org) {
   const sfLine = availN
     ? (demisN ? `${flyerFmtSf(availN)} SF Demisable to ${flyerFmtSf(demisN)} SF` : `${flyerFmtSf(availN)} SF`)
     : null;
-  const hdrSub = [payload.listing_type || 'For Lease', payload.suite ? ('Suite ' + String(payload.suite).replace(/^suite\s*/i, '')) : null, sfLine]
-    .filter(Boolean).map(esc).join('&ensp;|&ensp;');
+  const hdrParts = [payload.listing_type || 'For Lease', payload.suite ? ('Suite ' + String(payload.suite).replace(/^suite\s*/i, '')) : null, sfLine].filter(Boolean);
+  // The FOR LEASE line must NEVER wrap or overflow: nowrap is in the CSS; long content steps the
+  // font down (measured: default 14pt fits ~60 chars in the header's usable width).
+  const hdrLen = hdrParts.join(' | ').length;
+  let hdrSub = hdrParts.map(esc).join('&ensp;|&ensp;');
+  if (hdrLen > 74) hdrSub = '<span style="font-size:9.5pt; letter-spacing:0.6px">' + hdrSub + '</span>';
+  else if (hdrLen > 60) hdrSub = '<span style="font-size:11.5pt; letter-spacing:1px">' + hdrSub + '</span>';
 
   // Floor-plan callout boxes: demisable -> the two suite splits; otherwise one box for the full space.
   const callouts = (availN && demisN && availN > demisN)
@@ -998,6 +1003,18 @@ function buildFlyerVars(payload, org) {
   const spaceItems = (Array.isArray(payload.space_highlights) ? payload.space_highlights : [])
     .filter((h) => !/^\s*available\s+space\b/i.test(String(h)));
   const availRow = sfLine ? '<li>Available Space:<br>' + esc(sfLine) + '</li>' : '';
+
+  // Rate must appear exactly ONCE on page 2. If a real rate is set AND the broker already put a
+  // rate line in their highlights, the CTA row is suppressed (their placement wins). A real rate
+  // NOT in the highlights renders in the CTA row so it can't vanish. No rate -> default CTA.
+  const realRate = payload.lease_rate && !/call\s+(the\s+)?broker/i.test(String(payload.lease_rate));
+  const rateInHighlights = spaceItems.some((h) => /\$\s*\d|\/\s*SF\b|NNN|per\s+(sq|square)|lease\s+rate/i.test(String(h)));
+  const rateRow = (realRate && rateInHighlights) ? ''
+    : '<li class="cta-li">' + esc(realRate ? payload.lease_rate : 'Call Broker for Rates') + '</li>';
+
+  // Few highlights spread across the full column by v8's space-between read as broken whitespace;
+  // short lists top-stack instead (hi-few), 5+ keep the original even fill.
+  const hiClass = (Array.isArray(payload.building_highlights) && payload.building_highlights.length >= 5) ? '' : ' hi-few';
 
   // Footer contacts: the brokers on THIS listing (agent collects co_broker_names); default first two.
   const names = Array.isArray(payload.co_broker_names) ? payload.co_broker_names : [];
@@ -1033,7 +1050,8 @@ function buildFlyerVars(payload, org) {
     CALLOUTS: callouts,
     PHOTO_P2_INTERIOR: flyerPhoto(ph.office, '📷', 'Interior Office Photo', 'height:2.8in; flex-shrink:0; margin-bottom:6px'),
     SPACE_HIGHLIGHTS: availRow + liList(spaceItems),
-    RATE_CTA: esc(payload.lease_rate || 'Call Broker for Rates'),
+    RATE_ROW: rateRow,
+    HI_CLASS: hiClass,
     FIRM_LEGAL: esc((org && org.firm_legal) || FLYER_FIRM_DEFAULTS.firm_legal),
     PHOTO_P3_TOP: flyerPhoto(ph.aerial, '📷', 'Aerial / Parking Photo — Full Width', 'height:100%'),
     // No captions under the detail row (clean look, no wrong-label risk) — placeholder text

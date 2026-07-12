@@ -194,6 +194,10 @@ body {
 }
 .hi li:last-child { border-bottom:1px dotted #e8a068; }
 .hi li:first-child { text-transform: uppercase; } /* lead highlight always caps, regardless of intake casing */
+/* Short lists (<5 items): v8's space-between across the full column reads as broken whitespace,
+   so they top-stack with tight spacing instead. 5+ items keep the original even fill. */
+.hi.hi-few { justify-content:flex-start; }
+.hi.hi-few li { margin-bottom:10px; flex:none; }
 .hi li::before {
   display:none;
 }
@@ -391,7 +395,7 @@ body {
   <div class="p1-lower">
     <div class="p1-left">
       <div class="sh">Building Highlights</div>
-      <ul class="hi">{{BUILDING_HIGHLIGHTS}}</ul>
+      <ul class="hi{{HI_CLASS}}">{{BUILDING_HIGHLIGHTS}}</ul>
     </div>
     <div class="p1-right">
       {{PHOTO_P1_SIDE}}
@@ -431,7 +435,7 @@ body {
     <div class="p2-right">
       <div class="sh" style="border-top:1px dotted #D9591B; border-bottom:none; padding-top:8px; margin-bottom:8px;">Space Highlights</div>
       {{PHOTO_P2_INTERIOR}}
-      <ul class="cl">{{SPACE_HIGHLIGHTS}}<li class="cta-li">{{RATE_CTA}}</li></ul>
+      <ul class="cl">{{SPACE_HIGHLIGHTS}}{{RATE_ROW}}</ul>
       <div class="disclaimer">The information contained herein was obtained from sources believed reliable; however, {{FIRM_LEGAL}} makes no guarantees, warranties or representations as to the completeness or accuracy thereof. The presentation of this property is submitted subject to errors, omissions, change of price or conditions prior to sale or lease, or withdrawal without notice.</div>
     </div>
   </div>
