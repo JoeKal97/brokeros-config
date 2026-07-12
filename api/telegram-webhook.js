@@ -743,8 +743,9 @@ async function runTurn(token, chatId, incoming, ctx) {
   // resolved from an orgs row) get a neutral no-name persona; solo (no org row) stays Jessie —
   // the agent's default when no tag is present, so solo behavior is unchanged either way.
   const org = await sbGetOrgByToken(token); // Map-cached per instance; null for the solo bot
+  const orgRoster = org ? ((org.brand_config && org.brand_config.co_brokers) || []).map((b) => b && b.name).filter(Boolean) : [];
   const idTag = org
-    ? `[BOT IDENTITY: firm — ${org.org_name}. Shared firm bot: greet neutrally and briefly, never use a personal broker name, never present yourself as Jessie or Eagen Real Estate. Supported doc types: ${((org.brand_config && org.brand_config.doc_types) || ['flyer']).join(', ')}.]\n`
+    ? `[BOT IDENTITY: firm — ${org.org_name}. Shared firm bot: greet neutrally and briefly, never use a personal broker name, never present yourself as Jessie or Eagen Real Estate. Supported doc types: ${((org.brand_config && org.brand_config.doc_types) || ['flyer']).join(', ')}. Broker roster: ${orgRoster.join(', ') || 'none on file'}.]\n`
     : '';
   if (isNewSession && idTag) toSend = idTag + toSend;
 
@@ -1306,7 +1307,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ selftest: 'whisper', key_present: !!k, key_len: k.length });
   }
   if (req.method === 'GET' || (req.query && req.query.version !== undefined)) {
-    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 7 });
+    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 8 });
   }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 

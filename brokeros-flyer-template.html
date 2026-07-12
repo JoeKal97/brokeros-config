@@ -207,13 +207,15 @@ body {
 .cl li {
   font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;
   font-weight:500; font-size:11pt;
-  letter-spacing:.5px; text-transform:uppercase;
+  letter-spacing:.5px; /* broker's own casing renders as typed */
   border-bottom:1px dotted #e8a068;
   flex:1;
   min-height:0;
   display:flex;
   align-items:center;
 }
+/* Only the derived rows stay caps: the Available Space top row and the rate CTA. */
+.cl li.cl-caps, .cl li.cta-li { text-transform:uppercase; }
 .cl li:last-child { border-bottom:1px dotted #e8a068; }
 .cta-li {
   font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;

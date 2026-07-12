@@ -985,8 +985,8 @@ function buildFlyerVars(payload, org) {
   // font down (measured: default 14pt fits ~60 chars in the header's usable width).
   const hdrLen = hdrParts.join(' | ').length;
   let hdrSub = hdrParts.map(esc).join('&ensp;|&ensp;');
-  if (hdrLen > 74) hdrSub = '<span style="font-size:9.5pt; letter-spacing:0.6px">' + hdrSub + '</span>';
-  else if (hdrLen > 60) hdrSub = '<span style="font-size:11.5pt; letter-spacing:1px">' + hdrSub + '</span>';
+  if (hdrLen > 62) hdrSub = '<span style="font-size:9.5pt; letter-spacing:0.6px">' + hdrSub + '</span>';
+  else if (hdrLen > 50) hdrSub = '<span style="font-size:11pt; letter-spacing:1px">' + hdrSub + '</span>';
 
   // Floor-plan callout boxes: demisable -> the two suite splits; otherwise one box for the full space.
   const callouts = (availN && demisN && availN > demisN)
@@ -1002,7 +1002,7 @@ function buildFlyerVars(payload, org) {
   // agent-supplied "Available Space..." item is dropped so it can't render twice.
   const spaceItems = (Array.isArray(payload.space_highlights) ? payload.space_highlights : [])
     .filter((h) => !/^\s*available\s+space\b/i.test(String(h)));
-  const availRow = sfLine ? '<li>Available Space:<br>' + esc(sfLine) + '</li>' : '';
+  const availRow = sfLine ? '<li class="cl-caps">Available Space:<br>' + esc(sfLine) + '</li>' : '';
 
   // Rate must appear exactly ONCE on page 2. If a real rate is set AND the broker already put a
   // rate line in their highlights, the CTA row is suppressed (their placement wins). A real rate
