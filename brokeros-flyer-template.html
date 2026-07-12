@@ -86,14 +86,14 @@ body {
   font-weight:500; font-size:14pt;
   letter-spacing:1.8px; text-transform:uppercase;
   color:#555; margin-top:10px; white-space:nowrap;
-  display:inline-block; transform:scaleY(1.35); transform-origin:left top;
+  display:block; transform:scaleY(1.35); transform-origin:left top;
 }
 .hdr-addr {
   font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;
   font-weight:600; font-size:13pt;
   letter-spacing:-0.5px; text-transform:uppercase;
   color:#3a3a3a; margin-top:10px;
-  display:inline-block; transform:scaleY(1.25); transform-origin:left top;
+  display:block; transform:scaleY(1.25); transform-origin:left top;
 }
 
 /* ── PHOTO PLACEHOLDER ── */
@@ -185,10 +185,10 @@ body {
 }
 
 /* ── HIGHLIGHT LIST ── */
-.hi { list-style:none; display:flex; flex-direction:column; justify-content:space-between; flex:1; min-height:0; }
+.hi { list-style:none; display:flex; flex-direction:column; justify-content:space-evenly; flex:1; min-height:0; }
 .hi li {
   font-size:10.5pt; line-height:1.4;
-  padding:6px 0 6px 16px;
+  padding:6px 0;
   border-bottom:1px dotted #e8a068;
   position:relative; color:#3a3a3a;
 }
