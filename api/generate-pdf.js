@@ -958,6 +958,17 @@ function flyerPhoto(url, emoji, label, style = '') {
 const flyerSf = (v) => { const n = parseInt(String(v == null ? '' : v).replace(/[^0-9]/g, ''), 10); return isNaN(n) ? null : n; };
 const flyerFmtSf = (n) => n.toLocaleString('en-US');
 
+// Footer address: one comma-separated string -> stacked lines, keeping "City, ST ZIP" together
+// (a naive split-on-comma orphans "WA 98101" onto its own 4th line).
+function flyerAddrBlock(addr) {
+  const parts = String(addr).split(/,\s*/).map((s) => s.trim()).filter(Boolean);
+  if (parts.length >= 2 && /^[A-Za-z]{2}\.?\s+\d{5}(-\d{4})?$/.test(parts[parts.length - 1])) {
+    const stZip = parts.pop();
+    parts[parts.length - 1] += ', ' + stZip;
+  }
+  return parts.map(esc).join('<br>');
+}
+
 function buildFlyerVars(payload, org) {
   const brand = (org && org.brand_config) || {};
   const firmName = (org && org.org_name) || FLYER_FIRM_DEFAULTS.org_name;
@@ -1034,7 +1045,7 @@ function buildFlyerVars(payload, org) {
       || flyerPhoto(payload.amenities_map_url, '🗺️', 'Amenities Map — ' + (payload.address || 'Nearby'), 'flex:1; min-height:0'),
     AMENITY_ITEMS: amenities,
     FOOTER_CONTACTS: contacts,
-    FIRM_ADDR_BLOCK: (org && org.firm_address ? esc(org.firm_address).replace(/,\s*/g, '<br>') : FLYER_FIRM_DEFAULTS.firm_address_block),
+    FIRM_ADDR_BLOCK: (org && org.firm_address ? flyerAddrBlock(org.firm_address) : FLYER_FIRM_DEFAULTS.firm_address_block),
     FIRM_WEB_URL: 'https://' + String(website).replace(/^https?:\/\//i, ''),
     FIRM_WEBSITE: esc(website),
   };
