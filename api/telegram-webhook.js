@@ -193,6 +193,13 @@ function isXlsxDoc(doc) {
 function isCompPdf(doc) {
   return /\.pdf$/i.test(doc.file_name || '') || /application\/pdf/i.test(doc.mime_type || '');
 }
+// A photo sent AS A FILE (uncompressed) arrives as a `document` with an image mime, not as
+// `message.photo`. Route browser-renderable formats through the photo pipeline (flyer slots,
+// BPO/OM subject photos). HEIC/TIFF etc. can't render in the PDF -> nudge instead (below).
+function isImageDoc(doc) {
+  return /^image\/(jpe?g|png|webp|gif)/i.test(doc.mime_type || '') || /\.(jpe?g|png|webp|gif)$/i.test(doc.file_name || '');
+}
+const isOtherImageDoc = (doc) => /^image\//i.test(doc.mime_type || '') || /\.(heic|heif|tiff?|bmp)$/i.test(doc.file_name || '');
 
 // ---- message-type routing (unchanged) ----
 function classify(msg) {
@@ -1299,7 +1306,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ selftest: 'whisper', key_present: !!k, key_len: k.length });
   }
   if (req.method === 'GET' || (req.query && req.query.version !== undefined)) {
-    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 6 });
+    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 7 });
   }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
@@ -1330,9 +1337,10 @@ export default async function handler(req, res) {
     const doc = msg.document;
     const xlsx = isXlsxDoc(doc);
     const isPdf = !xlsx && isCompPdf(doc); // isCompPdf() matches all PDFs; OM-vs-comp decided by session below
-    const mode = xlsx ? 'xlsx' : isPdf ? 'pdf' : 'unsupported-file';
+    const img = !xlsx && !isPdf && isImageDoc(doc); // photo uploaded "as file" -> photo pipeline
+    const mode = xlsx ? 'xlsx' : isPdf ? 'pdf' : img ? 'image-document' : 'unsupported-file';
     res.status(200).json({ ok: true, version: VERSION, type, mode });
-    if ((xlsx || isPdf) && !sbConfigured()) {
+    if ((xlsx || isPdf || img) && !sbConfigured()) {
       waitUntil((async () => { try { await sendMessage(token, chatId, '⚙️ Session store not configured yet — add SUPABASE_URL and SUPABASE_SERVICE_KEY in Vercel and redeploy.'); } catch { /* ignore */ } })());
       return;
     }
@@ -1342,6 +1350,12 @@ export default async function handler(req, res) {
         // A PDF during an OM session = a financial summary (Claude vision); otherwise the MLS comp parser.
         const docType = await sbGetDocType(chatId);
         return docType === 'om' ? handleFinancialPdf(token, chatId, doc) : handleCompPdf(token, chatId, doc);
+      }
+      // handlePhoto picks the last array entry's file_id — a single-element wrapper fits its contract.
+      if (img) return handlePhoto(token, chatId, [{ file_id: doc.file_id }]);
+      if (isOtherImageDoc(doc)) {
+        try { await sendMessage(token, chatId, `That image format can’t go into the PDF (${doc.file_name || 'HEIC/TIFF'}). Send it as a regular photo instead — Telegram converts it automatically — or export it as JPG/PNG first.`); } catch { /* ignore */ }
+        return;
       }
       return handleUnsupportedFile(token, chatId, doc.file_name, 'document');
     })());
