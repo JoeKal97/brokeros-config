@@ -1032,7 +1032,8 @@ function buildFlyerVars(payload, org) {
     P3_CAP_B: esc(caps[1] || 'Reception / Waiting Area'),
     PHOTO_P3_C: flyerPhoto(ph.details[2], '📷', caps[2] || 'Conference Room'),
     P3_CAP_C: esc(caps[2] || 'Conference Room'),
-    PHOTO_AMENITIES_MAP: flyerPhoto(payload.amenities_map_url, '🗺️', 'Amenities Map — ' + (payload.address || 'Nearby'), 'flex:1; min-height:0'),
+    PHOTO_AMENITIES_MAP: payload._amenities_map_html
+      || flyerPhoto(payload.amenities_map_url, '🗺️', 'Amenities Map — ' + (payload.address || 'Nearby'), 'flex:1; min-height:0'),
     AMENITY_ITEMS: amenities,
     FOOTER_CONTACTS: contacts,
     FIRM_ADDR_BLOCK: (org && org.firm_address ? esc(org.firm_address).replace(/,\s*/g, '<br>') : FLYER_FIRM_DEFAULTS.firm_address_block),
@@ -1090,20 +1091,65 @@ async function flyerNearbyAmenities(centerLoc, key) {
   // Review volume ~ local prominence; mirrors the hand-picked feel of Orion's own list.
   found.sort((a, b) => b.n - a.n);
   const top = found.slice(0, 32);
-  return { names: top.map((p) => p.name), points: top.map((p) => p.loc).filter(Boolean) };
+  // points stays INDEX-ALIGNED with names (nulls kept) so map dot numbers match grid numbers.
+  return { names: top.map((p) => p.name), points: top.map((p) => p.loc) };
 }
 
-// Page-4 amenities map via Static Maps (same helper/key as the BPO maps): property pin in brand
-// orange, amenity dots in body gray, framed to fit everything. Returns a data URI or null.
-async function flyerAmenitiesMap(centerLoc, points, key) {
-  if (!centerLoc || !key) return null;
-  const params = ['size=640x420', 'scale=2', 'maptype=roadmap'];
-  const fit = points.length ? fitVisible([centerLoc, ...points]) : null;
-  if (fit) params.push(fit);
-  else params.push(`center=${encodeURIComponent(centerLoc)}`, 'zoom=15');
-  if (points.length) params.push(`markers=${encodeURIComponent('size:small|color:0x3a3a3a|' + points.join('|'))}`);
-  params.push(mk('0xD9591B', '', centerLoc)); // property pin
-  return staticMap(params, key);
+// Page-4 amenities map: NUMBERED markers matching the amenity grid (1-32), like Orion's own
+// flyer. Static Maps can't label markers with multi-digit numbers, so we fetch a MARKER-LESS
+// base image at a center/zoom WE compute, then overlay HTML circles at Web-Mercator-projected
+// percentage positions. PDFShift's Chrome renders the overlay — same fidelity as a headless
+// screenshot, no extra dependency. POI labels are styled off so Google's text can't collide
+// with our numbers.
+const AM_MAP_W = 640, AM_MAP_H = 334; // px coordinate space; CSS box matches this aspect
+
+function mercPx(lat, lng, zoom) {
+  const s = 256 * Math.pow(2, zoom);
+  const x = (lng + 180) / 360 * s;
+  const sin = Math.sin(lat * Math.PI / 180);
+  const y = (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * s;
+  return [x, y];
+}
+function mercUnproject(x, y, zoom) {
+  const s = 256 * Math.pow(2, zoom);
+  const lng = x / s * 360 - 180;
+  const lat = 180 / Math.PI * Math.atan(Math.sinh(Math.PI * (1 - 2 * y / s)));
+  return [lat, lng];
+}
+
+// points: array of "lat,lng" | null, INDEX-ALIGNED with the amenity grid so dot i reads i+1.
+async function flyerAmenitiesMapHtml(centerLoc, points, key) {
+  const prop = parseLoc(centerLoc);
+  if (!prop || !key) return null;
+  const locs = [prop, ...points.map(parseLoc).filter(Boolean)];
+  // Deepest zoom that fits every marker with edge padding; solo property pin gets neighborhood zoom.
+  let zoom = 15;
+  if (locs.length > 1) {
+    for (zoom = 16; zoom > 3; zoom--) {
+      const px = locs.map(([la, ln]) => mercPx(la, ln, zoom));
+      const xs = px.map((p) => p[0]), ys = px.map((p) => p[1]);
+      if (Math.max(...xs) - Math.min(...xs) <= AM_MAP_W - 60 && Math.max(...ys) - Math.min(...ys) <= AM_MAP_H - 60) break;
+    }
+  }
+  const px = locs.map(([la, ln]) => mercPx(la, ln, zoom));
+  const xs = px.map((p) => p[0]), ys = px.map((p) => p[1]);
+  const cx = (Math.max(...xs) + Math.min(...xs)) / 2, cy = (Math.max(...ys) + Math.min(...ys)) / 2;
+  const [cLat, cLng] = mercUnproject(cx, cy, zoom);
+  const img = await staticMap([
+    `center=${encodeURIComponent(cLat.toFixed(6) + ',' + cLng.toFixed(6))}`,
+    `zoom=${zoom}`, `size=${AM_MAP_W}x${AM_MAP_H}`, 'scale=2', 'maptype=roadmap',
+    `style=${encodeURIComponent('feature:poi|element:labels|visibility:off')}`,
+  ], key);
+  if (!img) return null;
+  const at = (la, ln) => {
+    const [x, y] = mercPx(la, ln, zoom);
+    return `left:${((x - cx) / AM_MAP_W * 100 + 50).toFixed(2)}%;top:${((y - cy) / AM_MAP_H * 100 + 50).toFixed(2)}%`;
+  };
+  const dots = points.map((p, i) => {
+    const l = parseLoc(p);
+    return l ? `<div class="am-dot" style="${at(l[0], l[1])}">${i + 1}</div>` : '';
+  }).join('');
+  return `<div class="am-map" style="height:4in"><img class="am-map-img" src="${img}">${dots}<div class="am-prop" style="${at(prop[0], prop[1])}"></div></div>`;
 }
 
 async function assembleFlyer(payload, org) {
@@ -1122,8 +1168,8 @@ async function assembleFlyer(payload, org) {
     if (auto.names.length) { payload = { ...payload, amenities: auto.names }; amenityPoints = auto.points; }
   }
   if (!payload.amenities_map_url && centerLoc) {
-    const mapUri = await flyerAmenitiesMap(centerLoc, amenityPoints, gKey);
-    if (mapUri) payload = { ...payload, amenities_map_url: mapUri };
+    const mapHtml = await flyerAmenitiesMapHtml(centerLoc, amenityPoints, gKey);
+    if (mapHtml) payload = { ...payload, _amenities_map_html: mapHtml };
   }
   let source = fillTemplate(tpl, buildFlyerVars(payload, org));
   // Brand overrides from the org row: accent color swap + hosted logo (template default is Orion).

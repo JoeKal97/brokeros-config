@@ -1106,13 +1106,13 @@ async function injectPhotosAndReply(token, chatId, urls) {
   const isFlyer = !!(row && row.active_doc_type === 'flyer');
   await sendMessage(token, chatId, many ? `Got your ${n} photos — I’ll place them across the ${isOm ? 'OM' : isFlyer ? 'flyer' : 'BPO'}.` : 'Got the property photo.');
   const injection = isFlyer
-    ? `[The broker sent ${n} photo${many ? 's together (a batch)' : ''} for the FLYER. Public URL${many ? 's, numbered in upload order' : ''}:\n${urls.map((u, i) => `${i + 1}. ${u}`).join('\n')}\n` +
-      `FLYER PHOTO RULES:\n` +
-      `- Do NOT guess which slot a photo belongs to — upload order means nothing.\n` +
-      `- ASK the broker to label them in ONE short question, by number (skip labels already assigned in this session and labels the broker says they don't have): which is the FLOOR PLAN, the main EXTERIOR/HERO shot (page 1), the page-1 INTERIOR, the full-width AERIAL/PARKING shot (page 3), the page-2 OFFICE interior, and which (up to 3) are the small page-3 DETAIL shots.\n` +
-      `- Place each URL into the labeled payload fields per their answer: photos.hero_url, photos.interior_url, photos.aerial_url, photos.detail_urls (array, max 3), photos.office_url, floor_plan_url, amenities_map_url. "photos" is an OBJECT with these keys, not an array.\n` +
-      `- Keep labels assigned earlier in the session; never drop previously placed photos.\n` +
-      `- The broker was ALREADY told the count. Do not re-list URLs — refer to photos by their numbers.]`
+    ? `[The broker sent ${n} photo${many ? 's together (a batch)' : ''} for the FLYER. Public URL${many ? 's, in upload order' : ''}:\n${urls.map((u, i) => `${i + 1}. ${u}`).join('\n')}\n` +
+      `FLYER PHOTO RULES (slot-by-slot collection):\n` +
+      `- You collect photos ONE SLOT AT A TIME in this fixed order: hero exterior (p1) -> interior (p1) -> floor plan (p2) -> office interior (p2) -> aerial/parking (p3 top) -> up to 3 detail shots (p3 row).\n` +
+      `- Assign ${many ? 'these URLs' : 'this URL'} to the slot(s) you are currently collecting, IN ORDER, starting at the slot you last asked for and continuing down the sequence if extra photos arrived. Do NOT ask the broker to label photos.\n` +
+      `- EXCEPTION: if the broker's own words (before or after the upload) said what a photo is ("this is the floor plan"), honor that over the sequence.\n` +
+      `- Fields: photos.hero_url, photos.interior_url, photos.aerial_url, photos.detail_urls (array, max 3), photos.office_url, floor_plan_url. "photos" is an OBJECT, not an array. Keep everything placed earlier.\n` +
+      `- Reply with a SHORT acknowledgment naming what was placed, then immediately ask for the NEXT unfilled slot by name ("Got the floor plan. Now the office interior for page 2 — or say skip."). If all slots are filled or skipped, continue the flyer intake flow.]`
     : isOm
     ? `[The broker sent ${n} property photo${many ? 's together (a batch)' : ''} for the OM. Public URL${many ? 's IN ORDER' : ''}:\n${urls.join('\n')}\n` +
       `OM PHOTO RULES:\n` +
@@ -1299,7 +1299,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ selftest: 'whisper', key_present: !!k, key_len: k.length });
   }
   if (req.method === 'GET' || (req.query && req.query.version !== undefined)) {
-    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 5 });
+    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 6 });
   }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
