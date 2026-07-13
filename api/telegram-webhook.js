@@ -86,6 +86,8 @@ function requireAgentId() {
 const GENERATE_PDF_URL = 'https://brokeros-config.vercel.app/api/generate-pdf';
 const PARSE_RENTROLL_URL = 'https://brokeros-config.vercel.app/api/parse-rentroll';
 const PARSE_COMP_URL = 'https://brokeros-config.vercel.app/api/parse-comp-pdf';
+const PARSE_COSTAR_URL = 'https://brokeros-config.vercel.app/api/parse-costar';
+const PARSE_DOCX_URL = 'https://brokeros-config.vercel.app/api/parse-docx';
 
 const TERMINAL = new Set(['session.status_idle', 'session.status_terminated', 'session.error']);
 const TG_API = (token, m) => `https://api.telegram.org/bot${token}/${m}`;
@@ -200,6 +202,15 @@ function isImageDoc(doc) {
   return /^image\/(jpe?g|png|webp|gif)/i.test(doc.mime_type || '') || /\.(jpe?g|png|webp|gif)$/i.test(doc.file_name || '');
 }
 const isOtherImageDoc = (doc) => /^image\//i.test(doc.mime_type || '') || /\.(heic|heif|tiff?|bmp)$/i.test(doc.file_name || '');
+// Word doc (OM / Proposal draft) — routed to parse-docx on any bot.
+const isDocxDoc = (doc) => /\.docx$/i.test(doc.file_name || '') || /officedocument\.wordprocessingml\.document/i.test(doc.mime_type || '');
+// "generate OM/proposal" against a stored Word-doc draft (docx ingestion brief §3c).
+const GENERATE_FROM_DOCX_RE = /\b(?:generate|create|make|build)\s+(?:the\s+)?(?:om|offering\s+memorandum|proposal|seller\s+rep(?:resentation)?)\b/i;
+// Broker commentary on extracted CoStar comps: "add comp notes", then "comp 2: <note>".
+const COMP_NOTES_RE = /\b(?:add|edit|update)\s+comp\s+(?:notes?|commentary|analysis)\b/i;
+const COMP_NOTE_LINE_RE = /^comp\s*#?\s*(\d+)\s*[:\-]\s*([\s\S]+)/i;
+// Normalized subject-property key linking uploads (docx draft, CoStar comps) to one property.
+const normPropertyKey = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80);
 
 // ---- message-type routing (unchanged) ----
 function classify(msg) {
@@ -694,6 +705,55 @@ async function runTurn(token, chatId, incoming, ctx) {
   const { genIntent, wantStart } = ctx;
   const freshDoc = wantStart ? freshDocType(incoming) : null; // 'om' | 'bpo' for a fresh start
 
+  // ---- bridge-level intercepts (no agent turn) --------------------------------
+  // PENDING COSTAR: we asked "which property are these comps for?" — this text is the answer.
+  if (row && row.pending_costar_path) {
+    if (wantStart) { await sbPatch(chatId, { pending_costar_path: null }); }
+    else {
+      const key = normPropertyKey(incoming);
+      if (!key) { await sendMessage(token, chatId, "I didn't catch a property name — reply with the property name or address for those comps."); return; }
+      const bytes = await downloadRawFile(row.pending_costar_path);
+      await sbPatch(chatId, { pending_costar_path: null, last_property_key: key });
+      if (!bytes) { await sendMessage(token, chatId, '⚠️ That parked PDF expired — please upload the CoStar report again.'); return; }
+      await runCoStarParse(token, chatId, null, bytes.toString('base64'), key);
+      return;
+    }
+  }
+  // COMP NOTES: "comp 2: <note>" writes broker commentary onto an extracted CoStar comp.
+  const noteMatch = incoming.match(COMP_NOTE_LINE_RE);
+  if (noteMatch && row && row.last_property_key) {
+    const table = await sbSetCompNote(chatId, row.last_property_key, parseInt(noteMatch[1], 10), noteMatch[2].trim());
+    await sendMessage(token, chatId, table ? `✅ Note saved on comp ${noteMatch[1]}.` : `Couldn't find comp ${noteMatch[1]} for this property — upload the CoStar report first, or check the number.`);
+    return;
+  }
+  if (COMP_NOTES_RE.test(incoming)) {
+    await sendMessage(token, chatId, 'Sure — reply one per message like: comp 2: sold off-market, strong basis.');
+    return;
+  }
+  // GENERATE FROM DOCX DRAFT: "generate OM/proposal" against a stored Word-doc extraction.
+  let docxInjection = null;
+  if (GENERATE_FROM_DOCX_RE.test(incoming) && row && row.last_property_key) {
+    const draft = await sbGetDocxDraft(chatId, row.last_property_key);
+    if (draft && draft.doc_type === 'proposal') {
+      await sendMessage(token, chatId, `Your proposal draft for ${draft.property_name || row.last_property_key} is stored and ready — the branded Proposal PDF template is the next build, so generation isn't live yet. Nothing to re-enter when it lands.`);
+      return;
+    }
+    if (draft && draft.doc_type === 'om') {
+      const saleComps = await getCompsForProperty(chatId, row.last_property_key, 'sale');
+      const rentComps = await getCompsForProperty(chatId, row.last_property_key, 'rent');
+      await sbSetDocType(chatId, 'om');
+      docxInjection =
+        `[The broker uploaded a Word-document OM draft which the system has ALREADY parsed — do NOT re-run the OM intake or ask for data that's below. Your job:\n` +
+        `1) Map the extracted fields below into the standard OM payload schema you use for GENERATE_OM. Carry values VERBATIM; never invent, infer, or recompute anything the extraction lacks — leave those fields out.\n` +
+        `2) Present ONE consolidated OM CONFIRMATION (price, NOI, units, address, and per-section row counts) and WAIT for the broker to confirm.\n` +
+        `3) On confirmation, emit GENERATE_OM with the full payload exactly as usual. Post-delivery corrections work as normal.\n` +
+        `EXTRACTED OM DRAFT (JSON):\n${JSON.stringify(draft.payload_json)}` +
+        (saleComps.length ? `\nSALE COMPS on file from CoStar (JSON):\n${JSON.stringify(saleComps)}` : '') +
+        (rentComps.length ? `\nRENT COMPS on file from CoStar (JSON):\n${JSON.stringify(rentComps)}` : '') + `]`;
+    }
+    // no draft -> fall through to the normal agent turn
+  }
+
   // Generate-intent: lock is held and we will run the turn -> acknowledge the BUILD immediately.
   if (genIntent && !buildAcked) {
     const dt = freshDoc || await sbGetDocType(chatId);
@@ -722,7 +782,9 @@ async function runTurn(token, chatId, incoming, ctx) {
 
   let sessionId;
   let isNewSession = false;
-  if (wantStart || !row) {              // START: fresh session, wiped clean
+  // A docx-generate injection continues the EXISTING session even when the phrasing ("make the
+  // OM") would normally read as a fresh start — the draft context must not be wiped.
+  if ((wantStart && !docxInjection) || !row) {              // START: fresh session, wiped clean
     const s = await newSession();
     sessionId = s.id;
     isNewSession = true;
@@ -735,9 +797,11 @@ async function runTurn(token, chatId, incoming, ctx) {
   }
 
   // Bare start command ("/start", "/new", "BPO", "flyer") -> kick the agent's intake; otherwise pass through.
-  let toSend = BARE_START_RE.test(normCmd(incoming))
-    ? `Hi, I need to start a new ${freshDoc === 'flyer' ? 'flyer' : freshDoc === 'om' ? 'OM' : 'BPO'}.`
-    : incoming;
+  let toSend = docxInjection
+    ? docxInjection
+    : BARE_START_RE.test(normCmd(incoming))
+      ? `Hi, I need to start a new ${freshDoc === 'flyer' ? 'flyer' : freshDoc === 'om' ? 'OM' : 'BPO'}.`
+      : incoming;
 
   // IDENTITY TAG (first turn of every new session): tells the agent WHO it is. Firm bots (token
   // resolved from an orgs row) get a neutral no-name persona; solo (no org row) stays Jessie —
@@ -1098,6 +1162,160 @@ async function uploadPhoto(bytes, key, ext) {
   return `${SB_URL}/storage/v1/object/public/${PHOTO_BUCKET}/${key}`;
 }
 
+// Raw (non-image) file to the storage bucket — used to PARK a CoStar PDF while we ask the broker
+// which property it belongs to. Same bucket/auth as uploadPhoto; path is the return value.
+async function uploadRawFile(bytes, key, contentType) {
+  try {
+    const r = await fetch(`${SB_URL}/storage/v1/object/${PHOTO_BUCKET}/${key}`, {
+      method: 'POST',
+      headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': contentType, 'x-upsert': 'true' },
+      body: bytes,
+    });
+    return r.ok ? key : null;
+  } catch { return null; }
+}
+async function downloadRawFile(key) {
+  try {
+    const r = await fetch(`${SB_URL}/storage/v1/object/${PHOTO_BUCKET}/${key}`, { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } });
+    return r.ok ? Buffer.from(await r.arrayBuffer()) : null;
+  } catch { return null; }
+}
+
+// ---- CoStar comp ingestion (firm bots) --------------------------------------
+// POST the PDF to parse-costar and confirm the extracted comps back to the broker.
+async function runCoStarParse(token, chatId, orgId, pdfBase64, propertyKey) {
+  const body = new URLSearchParams({ pdf_base64: pdfBase64, chat_id: String(chatId), property_key: propertyKey, ...(orgId ? { org_id: String(orgId) } : {}) }).toString();
+  let result = null;
+  try {
+    const r = await fetch(PARSE_COSTAR_URL, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+    result = await r.json().catch(() => null);
+  } catch { /* handled below */ }
+  if (!result || !result.success) {
+    await sendMessage(token, chatId, `⚠️ Couldn't parse that PDF${result && result.error ? `: ${result.error}` : '. Please try again.'}`);
+    return false;
+  }
+  const typeLabel = result.reportType === 'sale' ? 'Sale Comps' : 'Rent Comps';
+  const lines = [`✅ Extracted ${result.compsExtracted} ${typeLabel}:`];
+  for (const c of result.comps) {
+    const price = c.sale_price || c.asking_rent_per_unit || '';
+    const psf = c.price_per_sf || c.rent_per_sf || '';
+    lines.push(`${c.comp_number}. ${c.address}${price ? ' — ' + price : ''}${psf ? ' (' + psf + ')' : ''}`);
+  }
+  lines.push('');
+  lines.push('These are saved for this property and will feed the OM/Proposal. To add commentary, reply like: comp 2: sold off-market, strong basis.');
+  await sendMessage(token, chatId, lines.join('\n'));
+  return true;
+}
+
+// A PDF arrived on a FIRM bot = a CoStar comp report (Orion's PDF use case). Solo-bot PDFs keep
+// the existing MLS-comp / OM-financial routing untouched.
+async function handleCoStarPdf(token, chatId, orgId, doc) {
+  const stop = startTyping(token, chatId);
+  try {
+    await sendMessage(token, chatId, '📊 Got it — parsing your CoStar comp report ⏳');
+    const meta = await tgGetFile(token, doc.file_id);
+    const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
+    if (!bytes) { await sendMessage(token, chatId, 'Couldn’t download that PDF from Telegram — send it again.'); return; }
+    const row = await sbGet(chatId);
+    const propertyKey = row && row.last_property_key;
+    if (!propertyKey) {
+      // Park the PDF and ask which property it belongs to; the next text reply resolves it.
+      const path = await uploadRawFile(bytes, `costar-pending/${chatId}.pdf`, 'application/pdf');
+      if (path) {
+        if (!row) { try { const s = await newSession(); await sbUpsert(chatId, s.id, s.envId); } catch { /* session optional here */ } }
+        await sbPatch(chatId, { pending_costar_path: path });
+        await sendMessage(token, chatId, "Which property are these comps for? Reply with the property name or address and I'll file them.");
+      } else {
+        await sendMessage(token, chatId, '⚠️ Couldn’t stash that PDF. Tell me the property first ("Working on 705 Lofts"), then send it again.');
+      }
+      return;
+    }
+    await runCoStarParse(token, chatId, orgId, bytes.toString('base64'), propertyKey);
+  } catch (e) {
+    console.error('handleCoStarPdf error:', (e && e.message) || e);
+    try { await sendMessage(token, chatId, '⚠️ Error parsing CoStar PDF. Please try again.'); } catch { /* ignore */ }
+  } finally { stop(); }
+}
+
+// ---- Word-doc (OM / Proposal) ingestion --------------------------------------
+async function handleDocxUpload(token, chatId, orgId, doc) {
+  const stop = startTyping(token, chatId);
+  try {
+    await sendMessage(token, chatId, '📄 Got your Word doc — extracting property data now ⏳');
+    const meta = await tgGetFile(token, doc.file_id);
+    const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
+    if (!bytes) { await sendMessage(token, chatId, 'Couldn’t download that file from Telegram — send it again.'); return; }
+    const body = new URLSearchParams({ docx_base64: bytes.toString('base64'), chat_id: String(chatId), ...(orgId ? { org_id: String(orgId) } : {}) }).toString();
+    let result = null;
+    try {
+      const r = await fetch(PARSE_DOCX_URL, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+      result = await r.json().catch(() => null);
+    } catch { /* handled below */ }
+    if (!result || !result.success) {
+      await sendMessage(token, chatId, `⚠️ Couldn't read that document${result && result.error ? `: ${result.error}` : '. Please try again.'}`);
+      return;
+    }
+    // Link the session to this property; OM drafts also set the doc type so photo uploads route right.
+    if (!(await sbGet(chatId))) { try { const s = await newSession(); await sbUpsert(chatId, s.id, s.envId); } catch { /* optional */ } }
+    await sbPatch(chatId, { last_property_key: result.propertyKey });
+    if (result.docType === 'om') await sbSetDocType(chatId, 'om');
+
+    const p = result.payload || {};
+    const typeLabel = result.docType === 'om' ? 'Offering Memorandum' : 'Seller Representation Proposal';
+    const lines = [`✅ Extracted ${typeLabel} draft for ${p.property_name || p.address || 'this property'} (${result.extractedFields} fields).`, ''];
+    if (p.address) lines.push(`📍 ${p.address}`);
+    if (p.t12_noi || p.noi_assumption) lines.push(`💰 NOI: ${p.t12_noi || p.noi_assumption}`);
+    if (p.total_residential_units) lines.push(`🏢 Units: ${p.total_residential_units}`);
+    if (p.offering_price || p.pricing_primary_recommended) lines.push(`💲 Price: ${p.offering_price || p.pricing_primary_recommended}`);
+    if (result.photoSlots > 0) {
+      lines.push('');
+      lines.push(`📷 The doc has ${result.photoSlots} photo slots — send photos any time and I'll place them.`);
+    }
+    lines.push('');
+    lines.push(result.docType === 'om'
+      ? 'Reply "generate OM" when you\'re ready and I\'ll build it from this draft.'
+      : 'Draft stored. The branded Proposal PDF is the next build — your data is saved and ready for it.');
+    await sendMessage(token, chatId, lines.join('\n'));
+  } catch (e) {
+    console.error('handleDocxUpload error:', (e && e.message) || e);
+    try { await sendMessage(token, chatId, '⚠️ Error processing Word doc. Please try again.'); } catch { /* ignore */ }
+  } finally { stop(); }
+}
+
+// Draft + comp retrieval for the generate-from-docx flow.
+async function sbGetDocxDraft(chatId, propertyKey) {
+  if (!sbConfigured() || !propertyKey) return null;
+  try {
+    const r = await fetch(`${SB_URL}/rest/v1/docx_drafts?telegram_chat_id=eq.${encodeURIComponent(String(chatId))}&property_key=eq.${encodeURIComponent(propertyKey)}&select=*&limit=1`, { headers: sbHeaders() });
+    if (!r.ok) return null;
+    const rows = await r.json();
+    return Array.isArray(rows) && rows.length ? rows[0] : null;
+  } catch { return null; }
+}
+async function getCompsForProperty(chatId, propertyKey, type = 'sale') {
+  if (!sbConfigured() || !propertyKey) return [];
+  const table = type === 'sale' ? 'costar_sale_comps' : 'costar_rent_comps';
+  try {
+    const r = await fetch(`${SB_URL}/rest/v1/${table}?telegram_chat_id=eq.${encodeURIComponent(String(chatId))}&property_key=eq.${encodeURIComponent(propertyKey)}&order=comp_number.asc`, { headers: sbHeaders() });
+    if (!r.ok) return [];
+    const rows = await r.json();
+    return (Array.isArray(rows) ? rows : []).map(({ id, telegram_chat_id, org_id, property_key, photo_base64, created_at, ...c }) => c);
+  } catch { return []; }
+}
+// "comp N: <note>" -> broker_notes on that comp (sale table first, rent fallback).
+async function sbSetCompNote(chatId, propertyKey, compNumber, note) {
+  for (const table of ['costar_sale_comps', 'costar_rent_comps']) {
+    try {
+      const r = await fetch(`${SB_URL}/rest/v1/${table}?telegram_chat_id=eq.${encodeURIComponent(String(chatId))}&property_key=eq.${encodeURIComponent(propertyKey)}&comp_number=eq.${compNumber}`, {
+        method: 'PATCH', headers: { ...sbHeaders(), Prefer: 'return=representation' },
+        body: JSON.stringify({ broker_notes: note }),
+      });
+      if (r.ok) { const rows = await r.json().catch(() => []); if (Array.isArray(rows) && rows.length) return table; }
+    } catch { /* try next table */ }
+  }
+  return null;
+}
+
 // Inject one OR a whole batch of subject-photo URLs in a SINGLE turn, and send ONE "got your N photos"
 // (the bridge owns the count confirmation). Caller holds the turn lock. Used for the settled batch and
 // the no-column fallback (1).
@@ -1307,7 +1525,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ selftest: 'whisper', key_present: !!k, key_len: k.length });
   }
   if (req.method === 'GET' || (req.query && req.query.version !== undefined)) {
-    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 8 });
+    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 9 });
   }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
@@ -1315,10 +1533,11 @@ export default async function handler(req, res) {
   // Firm bots (Orion) register with ?bot_id=<numeric id>; we resolve their orgs row and use ITS
   // token for every reply this request. No bot_id -> solo default (Jessie's env token), unchanged.
   let token = process.env.TELEGRAM_BOT_TOKEN;
+  let firmOrg = null; // resolved orgs row when this request came in on a firm bot (Orion)
   const botId = String((req.query && req.query.bot_id) || '').trim();
   if (/^\d+$/.test(botId)) {
     const org = await sbGetOrgByBotId(botId);
-    if (org && org.telegram_bot_token) token = org.telegram_bot_token;
+    if (org && org.telegram_bot_token) { token = org.telegram_bot_token; firmOrg = org; }
     else console.error(`bot_id ${botId} matched no active orgs row — replying via solo default token`);
   }
 
@@ -1337,18 +1556,22 @@ export default async function handler(req, res) {
   if (type === 'document') {
     const doc = msg.document;
     const xlsx = isXlsxDoc(doc);
-    const isPdf = !xlsx && isCompPdf(doc); // isCompPdf() matches all PDFs; OM-vs-comp decided by session below
-    const img = !xlsx && !isPdf && isImageDoc(doc); // photo uploaded "as file" -> photo pipeline
-    const mode = xlsx ? 'xlsx' : isPdf ? 'pdf' : img ? 'image-document' : 'unsupported-file';
+    const docx = !xlsx && isDocxDoc(doc); // Word draft (OM/Proposal) -> parse-docx, any bot
+    const isPdf = !xlsx && !docx && isCompPdf(doc); // isCompPdf() matches all PDFs; routing below
+    const img = !xlsx && !docx && !isPdf && isImageDoc(doc); // photo uploaded "as file" -> photo pipeline
+    const mode = xlsx ? 'xlsx' : docx ? 'docx' : isPdf ? (firmOrg ? 'costar-pdf' : 'pdf') : img ? 'image-document' : 'unsupported-file';
     res.status(200).json({ ok: true, version: VERSION, type, mode });
-    if ((xlsx || isPdf || img) && !sbConfigured()) {
+    if ((xlsx || docx || isPdf || img) && !sbConfigured()) {
       waitUntil((async () => { try { await sendMessage(token, chatId, '⚙️ Session store not configured yet — add SUPABASE_URL and SUPABASE_SERVICE_KEY in Vercel and redeploy.'); } catch { /* ignore */ } })());
       return;
     }
     waitUntil((async () => {
       if (xlsx) return handleXlsx(token, chatId, doc);
+      if (docx) return handleDocxUpload(token, chatId, firmOrg ? firmOrg.id : null, doc);
       if (isPdf) {
-        // A PDF during an OM session = a financial summary (Claude vision); otherwise the MLS comp parser.
+        // FIRM bots (Orion): a PDF is a CoStar comp report. SOLO bot keeps the existing routing:
+        // OM session -> financial summary (Claude vision); otherwise the MLS Matrix comp parser.
+        if (firmOrg) return handleCoStarPdf(token, chatId, firmOrg.id, doc);
         const docType = await sbGetDocType(chatId);
         return docType === 'om' ? handleFinancialPdf(token, chatId, doc) : handleCompPdf(token, chatId, doc);
       }
