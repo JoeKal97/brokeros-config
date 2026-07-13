@@ -1202,7 +1202,8 @@ async function runCoStarParse(token, chatId, orgId, pdfBase64, propertyKey) {
     lines.push(`${c.comp_number}. ${c.address}${price ? ' — ' + price : ''}${psf ? ' (' + psf + ')' : ''}`);
   }
   lines.push('');
-  lines.push('These are saved for this property and will feed the OM/Proposal. To add commentary, reply like: comp 2: sold off-market, strong basis.');
+  if (result.stored === false) lines.push(`⚠️ Extracted but NOT saved (${result.storageError || 'storage unavailable'}) — Joe needs to run the migration, then re-upload.`);
+  else lines.push('These are saved for this property and will feed the OM/Proposal. To add commentary, reply like: comp 2: sold off-market, strong basis.');
   await sendMessage(token, chatId, lines.join('\n'));
   return true;
 }
@@ -1272,7 +1273,8 @@ async function handleDocxUpload(token, chatId, orgId, doc) {
       lines.push(`📷 The doc has ${result.photoSlots} photo slots — send photos any time and I'll place them.`);
     }
     lines.push('');
-    lines.push(result.docType === 'om'
+    if (result.stored === false) lines.push(`⚠️ Extracted but NOT saved (${result.storageError || 'storage unavailable'}) — Joe needs to run the migration, then re-upload.`);
+    else lines.push(result.docType === 'om'
       ? 'Reply "generate OM" when you\'re ready and I\'ll build it from this draft.'
       : 'Draft stored. The branded Proposal PDF is the next build — your data is saved and ready for it.');
     await sendMessage(token, chatId, lines.join('\n'));

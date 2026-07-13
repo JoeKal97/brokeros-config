@@ -262,14 +262,14 @@ export default async function handler(req, res) {
       updated_at: new Date().toISOString(),
     }),
   });
+  let stored = up.ok;
+  let storageError = null;
   if (!up.ok) {
     const detail = await up.text().catch(() => '');
-    const missing = /PGRST205|Could not find the table/i.test(detail);
-    return res.status(500).json({
-      error: missing
-        ? 'Supabase table "docx_drafts" is missing — run docs/costar-docx-migration.sql in the SQL editor.'
-        : 'Supabase upsert failed: ' + detail.slice(0, 300),
-    });
+    storageError = /PGRST205|Could not find the table/i.test(detail)
+      ? 'table "docx_drafts" missing — run docs/costar-docx-migration.sql'
+      : detail.slice(0, 200);
+    console.error('docx upsert failed:', storageError);
   }
 
   const extractedFields = Object.keys(payload).filter((k) => {
@@ -283,6 +283,8 @@ export default async function handler(req, res) {
     propertyKey,
     photoSlots,
     extractedFields,
+    stored,
+    ...(storageError ? { storageError } : {}),
     payload,
   });
 }

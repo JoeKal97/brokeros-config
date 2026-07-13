@@ -156,13 +156,14 @@ export default async function handler(req, res) {
     return res.status(422).json({ error: 'No comparables found in PDF.' });
   }
 
-  // Whitelist columns (Claude output -> known table cols only), stringify values.
+  // Whitelist columns (Claude output -> known table cols only). Every row carries the FULL
+  // column set (nulls included) — PostgREST bulk insert rejects ragged key sets (PGRST102).
   const cols = reportType === 'sale' ? SALE_COLS : RENT_COLS;
   const rows = comps.map((c, i) => {
     const row = { telegram_chat_id: String(chatId), org_id: orgId, property_key: propertyKey };
     for (const k of cols) {
-      if (c[k] === undefined || c[k] === null) continue;
-      row[k] = k === 'comp_number' ? (parseInt(c[k], 10) || i + 1) : String(c[k]);
+      row[k] = (c[k] === undefined || c[k] === null || c[k] === '') ? null
+        : k === 'comp_number' ? (parseInt(c[k], 10) || i + 1) : String(c[k]);
     }
     if (!row.comp_number) row.comp_number = i + 1;
     return row;
@@ -177,21 +178,24 @@ export default async function handler(req, res) {
     method: 'POST', headers: { ...sbHeaders(), Prefer: 'return=minimal' },
     body: JSON.stringify(rows),
   });
+  let stored = ins.ok;
+  let storageError = null;
   if (!ins.ok) {
     const detail = await ins.text().catch(() => '');
-    const missing = /PGRST205|Could not find the table/i.test(detail);
-    return res.status(500).json({
-      error: missing
-        ? `Supabase table "${table}" is missing — run docs/costar-docx-migration.sql in the SQL editor.`
-        : 'Supabase insert failed: ' + detail.slice(0, 300),
-    });
+    storageError = /PGRST205|Could not find the table/i.test(detail)
+      ? `table "${table}" missing — run docs/costar-docx-migration.sql`
+      : detail.slice(0, 200);
+    console.error('costar insert failed:', storageError);
   }
 
+  // Extraction succeeded either way — return it so the broker isn't blocked pre-migration.
   return res.status(200).json({
     success: true,
     reportType,
     compsExtracted: rows.length,
     table,
+    stored,
+    ...(storageError ? { storageError } : {}),
     comps: rows.map(({ telegram_chat_id, org_id, property_key, ...c }) => c),
   });
 }
