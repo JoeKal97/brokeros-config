@@ -8,6 +8,10 @@
       "maxDuration": 60,
       "includeFiles": "{brokeros-template.html,brokeros-om-template.html,brokeros-flyer-template.html}"
     },
+    "api/generate-proposal.js": {
+      "maxDuration": 60,
+      "includeFiles": "templates/proposal-template-v3.html"
+    },
     "api/telegram-webhook.js": {
       "maxDuration": 300,
       "includeFiles": "node_modules/mupdf/dist/**"

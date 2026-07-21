@@ -84,6 +84,7 @@ function requireAgentId() {
   return AGENT_ID;
 }
 const GENERATE_PDF_URL = 'https://brokeros-config.vercel.app/api/generate-pdf';
+const GENERATE_PROPOSAL_URL = 'https://brokeros-config.vercel.app/api/generate-proposal';
 const PARSE_RENTROLL_URL = 'https://brokeros-config.vercel.app/api/parse-rentroll';
 const PARSE_COMP_URL = 'https://brokeros-config.vercel.app/api/parse-comp-pdf';
 const PARSE_COSTAR_URL = 'https://brokeros-config.vercel.app/api/parse-costar';
@@ -99,7 +100,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // word PLUS a BPO-ish object (bpo / b.p.o. / one / report / valuation / opinion) — or "start a bpo" /
 // "start over/fresh" — so it NEVER trips on data like "new construction", "new listing", or "start
 // with the address". normCmd folds spoken "B. P. O." -> "bpo" first so dotted/spaced forms match.
-const BARE_START_RE = /^\s*\/?(?:start|new|bpo|flyer)\s*$/i;
+const BARE_START_RE = /^\s*\/?(?:start|new|bpo|flyer|proposal)\s*$/i;
 const NEWBPO_RE = /\b(?:new|fresh|another)\s+(?:bpo|one|report|valuation|broker'?s?\s+(?:price\s+)?opinion)\b|\b(?:start|begin|create|make|do)\s+(?:an?\s+)?(?:new\s+|fresh\s+|another\s+)?(?:bpo|broker'?s?\s+(?:price\s+)?opinion)\b|\bstart\s+(?:over|fresh|anew)\b/i;
 // OM (offering memorandum) fresh-start. Requires a fresh-intent word + an OM-ish object (om /
 // offering memorandum), or "OM for <property>" — \bom\b boundaries avoid tripping on "from"/"some".
@@ -107,6 +108,12 @@ const NEWOM_RE = /\b(?:new|fresh|another)\s+(?:om|offering\s+memorandum)\b|\b(?:
 // FLYER fresh-start: fresh-intent word + a flyer-ish object ("new flyer", "make a property flyer",
 // "generate flyer"), or "flyer for <property>". "flyer" is a distinctive word — no fold needed.
 const NEWFLYER_RE = /\b(?:new|fresh|another)\s+(?:property\s+|listing\s+|marketing\s+)?flyer\b|\b(?:start|begin|create|make|do|generate)\s+(?:an?\s+)?(?:new\s+|fresh\s+|another\s+)?(?:property\s+|listing\s+|marketing\s+)?flyer\b|\bflyer\s+for\b/i;
+// PROPOSAL fresh-start: fresh-intent word + a proposal-ish object ("new proposal", "seller
+// proposal", "listing proposal", "new rep proposal", "start a seller representation proposal"),
+// or "proposal for <property>". "proposal" survives transcription cleanly — no voice folds needed.
+// NOTE: bare "seller proposal" / "listing proposal" (no fresh-intent verb) also start — those two
+// word pairs are unambiguous commands, never data.
+const NEWPROPOSAL_RE = /\b(?:new|fresh|another)\s+(?:seller\s+|listing\s+|rep(?:resentation)?\s+|seller\s+rep(?:resentation)?\s+)?proposal\b|\b(?:start|begin|create|make|do|generate)\s+(?:an?\s+)?(?:new\s+|fresh\s+|another\s+)?(?:seller\s+|listing\s+|rep(?:resentation)?\s+|seller\s+rep(?:resentation)?\s+)?proposal\b|\b(?:seller|listing)\s+proposal\b|\bproposal\s+for\b/i;
 // Fold dotted/spoken acronyms the voice path mangles. BPO fold runs FIRST so "b.p.o." is consumed
 // before the OM fold (otherwise its trailing "p.o." would mis-fold to OM). The OM fold also catches
 // common Whisper mis-transcriptions of spoken "OM": "O.M.", "oh em", "ohm", "peo", "p.o." — the
@@ -115,17 +122,17 @@ const NEWFLYER_RE = /\b(?:new|fresh|another)\s+(?:property\s+|listing\s+|marketi
 const normCmd = (s) => String(s || '')
   .replace(/\bb\.?\s*p\.?\s*o\.?\b/gi, 'bpo')
   .replace(/\b(?:o\.?\s*m\.?|oh[\s-]*em|ohm|peo|p\.\s*o\.?)\b/gi, 'om');
-const isFreshStart = (text) => { const t = normCmd(text); return BARE_START_RE.test(t) || NEWBPO_RE.test(t) || NEWOM_RE.test(t) || NEWFLYER_RE.test(t); };
-// Which doc type a fresh-start phrase implies: explicit FLYER/OM triggers win, everything else ->
-// 'bpo' (bare "/new" defaults to bpo, matching the bare-start intake injection below). Flyer is
-// checked FIRST — it's the most specific word and never collides with the om/bpo folds.
-const freshDocType = (text) => { const t = normCmd(text); return (NEWFLYER_RE.test(t) || /^\s*\/?flyer\s*$/i.test(t)) ? 'flyer' : NEWOM_RE.test(t) ? 'om' : 'bpo'; };
+const isFreshStart = (text) => { const t = normCmd(text); return BARE_START_RE.test(t) || NEWBPO_RE.test(t) || NEWOM_RE.test(t) || NEWFLYER_RE.test(t) || NEWPROPOSAL_RE.test(t); };
+// Which doc type a fresh-start phrase implies: explicit FLYER/PROPOSAL/OM triggers win, everything
+// else -> 'bpo' (bare "/new" defaults to bpo, matching the bare-start intake injection below).
+// Flyer/proposal are checked FIRST — distinctive words that never collide with the om/bpo folds.
+const freshDocType = (text) => { const t = normCmd(text); return (NEWFLYER_RE.test(t) || /^\s*\/?flyer\s*$/i.test(t)) ? 'flyer' : (NEWPROPOSAL_RE.test(t) || /^\s*\/?proposal\s*$/i.test(t)) ? 'proposal' : NEWOM_RE.test(t) ? 'om' : 'bpo'; };
 const END_RE = /^\s*\/?(cancel|done|reset|stop)\b/i;
 const RETRY_RE = /^\s*\/?(retry|resend|try\s*again|again|yes|yep|yeah|yup|ok(ay)?|sure|go|please)\b/i; // after a failed generation
 
 // Explicit "make the BPO now" intent -> acknowledge the BUILD immediately (don't wait ~1 min for
 // the agent to decide). Deliberately narrow (clear generate verbs) to avoid firing on plain confirms.
-const GENERATE_INTENT_RE = /\b(generate|build|create|produce|finali[sz]e)\b[^.!?]*\b(bpo|om|flyer|report|pdf|it|this|that)\b|^\s*\/?(generate|build\s*it|make\s*it|create\s*it|generate\s+(the\s+)?(bpo|om|flyer)|build\s+(the\s+)?(bpo|om|flyer)|make\s+(the\s+)?(bpo|om|flyer)|run\s*it|send\s*it|go\s*for\s*it|let'?s\s*go|fire\s*away)\s*$/i;
+const GENERATE_INTENT_RE = /\b(generate|build|create|produce|finali[sz]e)\b[^.!?]*\b(bpo|om|flyer|proposal|report|pdf|it|this|that)\b|^\s*\/?(generate|build\s*it|make\s*it|create\s*it|generate\s+(the\s+)?(bpo|om|flyer|proposal)|build\s+(the\s+)?(bpo|om|flyer|proposal)|make\s+(the\s+)?(bpo|om|flyer|proposal)|run\s*it|send\s*it|go\s*for\s*it|let'?s\s*go|fire\s*away)\s*$/i;
 
 // STATUS check-in ("you there?", "where's my PDF", "any update", "done yet?") -> answer with
 // real status, not a generic ack.
@@ -600,11 +607,19 @@ const sendTurn = (sessionId, text, deadlineMs) => sendTurnContent(sessionId, [{ 
 
 // ---- generate signal + PDF delivery ----
 function extractGenerate(reply) {
-  if (!/GENERATE_(?:BPO|OM|FLYER)/.test(reply)) return null;  // OM/FLYER payloads carry doc_type; the endpoint routes
+  if (!/GENERATE_(?:BPO|OM|FLYER|PROPOSAL)/.test(reply)) return null;  // OM/FLYER payloads carry doc_type; the endpoint routes
   const fenced = reply.match(/```(?:json|JSON)?\s*(\{[\s\S]*?\})\s*```/);
   const jtxt = fenced ? fenced[1] : (reply.match(/\{[\s\S]*\}/) || [])[0];
   if (!jtxt) return null;
-  try { return JSON.parse(jtxt); } catch { return null; }
+  try {
+    const payload = JSON.parse(jtxt);
+    // Proposal payloads are a flat variable map with no doc_type field — tag it from the
+    // marker so runGeneration routes to the proposal endpoint and words its acks correctly.
+    if (payload && typeof payload === 'object' && !payload.doc_type && /GENERATE_PROPOSAL/.test(reply)) {
+      payload.doc_type = 'proposal';
+    }
+    return payload;
+  } catch { return null; }
 }
 // Order-insensitive deep-equality for payloads (canonical JSON) — used to detect a post-gen
 // correction that changes nothing, so the bridge never claims a rebuild that didn't happen.
@@ -618,9 +633,10 @@ const payloadsEqual = (a, b) => { try { return canonJson(a) === canonJson(b); } 
 // here (the bridge owns all broker-facing wording, based on the actual outcome).
 async function generatePdf(payload) {
   const body = new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
+  const url = (payload && payload.doc_type === 'proposal') ? GENERATE_PROPOSAL_URL : GENERATE_PDF_URL;
   let r;
   try {
-    r = await fetch(GENERATE_PDF_URL, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+    r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
   } catch (e) {
     return { ok: false, status: 0, kind: 'network', detail: String((e && e.message) || e) };
   }
@@ -641,7 +657,8 @@ async function runGeneration(token, chatId, payload, opts = {}) {
   const docType = (payload && payload.doc_type) || 'bpo';  // delivery wording/filename per doc type
   const isOm = docType === 'om';
   const isFlyer = docType === 'flyer';
-  const DOC = isFlyer ? 'flyer' : isOm ? 'OM' : 'BPO';
+  const isProposal = docType === 'proposal';
+  const DOC = isProposal ? 'proposal' : isFlyer ? 'flyer' : isOm ? 'OM' : 'BPO';
   // Firm flyers render with the org's brand row (color/logo/roster); attach it once here so the
   // PDF endpoint stays Supabase-free. Missing org row -> endpoint falls back to Orion defaults.
   if (isFlyer && !payload.org) {
@@ -653,13 +670,17 @@ async function runGeneration(token, chatId, payload, opts = {}) {
   const result = await generatePdf(payload);
 
   if (result.ok) {
-    const addr = isFlyer
-      ? (payload.property_name || payload.address || 'Property')
-      : isOm
-        ? ((payload.property && (payload.property.name || payload.property.address_line1)) || 'OM')
-        : ((payload.subject && payload.subject.address_line1) || 'BPO');
+    const addr = isProposal
+      ? (payload.PROPERTY_ADDRESS_SHORT || payload.PROP_NAME || 'Property')
+      : isFlyer
+        ? (payload.property_name || payload.address || 'Property')
+        : isOm
+          ? ((payload.property && (payload.property.name || payload.property.address_line1)) || 'OM')
+          : ((payload.subject && payload.subject.address_line1) || 'BPO');
     const seed = String(addr).replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-    const fname = isFlyer ? `${seed}-Flyer.pdf` : `Eagen_${DOC}_${seed}.pdf`;
+    const fname = isProposal
+      ? `${String(addr).replace(/[\\/:*?"<>|]+/g, ' ').trim() || 'Property'} — Seller Proposal.pdf`
+      : isFlyer ? `${seed}-Flyer.pdf` : `Eagen_${DOC}_${seed}.pdf`;
     if (await sendDocument(token, chatId, result.bytes, fname)) {  // attach FIRST
       await sendMessage(token, chatId, `✅ Your ${DOC} is ready. Spot an error? Tell me the fix and I’ll update it — or say “new ${DOC}” to start another.`);
       await sbMarkDelivered(chatId);                               // keep the session for post-delivery edits
@@ -735,8 +756,13 @@ async function runTurn(token, chatId, incoming, ctx) {
   if (GENERATE_FROM_DOCX_RE.test(incoming) && row && row.last_property_key) {
     const draft = await sbGetDocxDraft(chatId, row.last_property_key);
     if (draft && draft.doc_type === 'proposal') {
-      await sendMessage(token, chatId, `Your proposal draft for ${draft.property_name || row.last_property_key} is stored and ready — the branded Proposal PDF template is the next build, so generation isn't live yet. Nothing to re-enter when it lands.`);
-      return;
+      await sbSetDocType(chatId, 'proposal');
+      docxInjection =
+        `[The broker uploaded a Word-document Seller Representation Proposal draft which the system has ALREADY parsed — do NOT re-run the proposal intake or ask for data that's below. Your job:\n` +
+        `1) Map the extracted fields below into the flat GENERATE_PROPOSAL variable payload you use for proposal generation. Carry values VERBATIM; never invent, infer, or recompute anything the extraction lacks — leave those variables as empty string "".\n` +
+        `2) Present ONE consolidated PROPOSAL CONFIRMATION (property, client, sizes, recommended price) and WAIT for the broker to confirm.\n` +
+        `3) On confirmation, emit GENERATE_PROPOSAL with the full payload exactly as usual. Post-delivery corrections work as normal.\n` +
+        `EXTRACTED PROPOSAL DRAFT (JSON):\n${JSON.stringify(draft.payload_json)}]`;
     }
     if (draft && draft.doc_type === 'om') {
       const saleComps = await getCompsForProperty(chatId, row.last_property_key, 'sale');
@@ -757,7 +783,7 @@ async function runTurn(token, chatId, incoming, ctx) {
   // Generate-intent: lock is held and we will run the turn -> acknowledge the BUILD immediately.
   if (genIntent && !buildAcked) {
     const dt = freshDoc || await sbGetDocType(chatId);
-    await sendMessage(token, chatId, `Got it — building your ${dt === 'om' ? 'OM' : dt === 'flyer' ? 'flyer' : 'BPO'} now ⏳`);
+    await sendMessage(token, chatId, `Got it — building your ${dt === 'om' ? 'OM' : dt === 'flyer' ? 'flyer' : dt === 'proposal' ? 'proposal' : 'BPO'} now ⏳`);
     buildAcked = true;
   }
 
@@ -800,7 +826,7 @@ async function runTurn(token, chatId, incoming, ctx) {
   let toSend = docxInjection
     ? docxInjection
     : BARE_START_RE.test(normCmd(incoming))
-      ? `Hi, I need to start a new ${freshDoc === 'flyer' ? 'flyer' : freshDoc === 'om' ? 'OM' : 'BPO'}.`
+      ? `Hi, I need to start a new ${freshDoc === 'flyer' ? 'flyer' : freshDoc === 'om' ? 'OM' : freshDoc === 'proposal' ? 'seller representation proposal' : 'BPO'}.`
       : incoming;
 
   // IDENTITY TAG (first turn of every new session): tells the agent WHO it is. Firm bots (token
@@ -840,7 +866,7 @@ async function runTurn(token, chatId, incoming, ctx) {
     // payload is byte-identical to what we last built, nothing changed — say so instead of falsely
     // running "Building…/ready" on an unchanged rebuild.
     if (editingDelivered && row && row.last_payload && payloadsEqual(payload, row.last_payload)) {
-      const docLabel = payload.doc_type === 'om' ? 'OM' : payload.doc_type === 'flyer' ? 'flyer' : 'BPO';
+      const docLabel = payload.doc_type === 'om' ? 'OM' : payload.doc_type === 'flyer' ? 'flyer' : payload.doc_type === 'proposal' ? 'proposal' : 'BPO';
       await sbTouch(chatId);
       await sendMessage(token, chatId, `That's already in the ${docLabel} as it stands — nothing changed in the document. If you want a specific edit, tell me exactly what to change (e.g. a different value, or "add it as a separate page/section").`);
       return;
@@ -850,7 +876,7 @@ async function runTurn(token, chatId, incoming, ctx) {
   }
 
   await sbTouch(chatId);
-  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM|FLYER)\s*/i, '').trim() || reply);
+  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM|FLYER|PROPOSAL)\s*/i, '').trim() || reply);
 }
 
 // An xlsx arrived: download -> parse -> inject parsed tenants into the chat's session so the
@@ -944,7 +970,7 @@ async function injectCompsAndReply(token, chatId, comps) {
   const payload = extractGenerate(reply);
   if (payload) { await runGeneration(token, chatId, payload); return; }
   await sbTouch(chatId);
-  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM|FLYER)\s*/i, '').trim() || reply);
+  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM|FLYER|PROPOSAL)\s*/i, '').trim() || reply);
 }
 
 // A comp PDF arrived: download -> parse-comp-pdf -> upload the extracted photo to Supabase ->
@@ -1058,7 +1084,7 @@ async function handleFinancialPdf(token, chatId, doc) {
     const payload = extractGenerate(reply);
     if (payload) { await runGeneration(token, chatId, payload); return; }
     await sbTouch(chatId);
-    await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM|FLYER)\s*/i, '').trim() || reply);
+    await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM|FLYER|PROPOSAL)\s*/i, '').trim() || reply);
 
   } catch (e) {
     console.error('handleFinancialPdf error:', (e && e.message) || e);
@@ -1361,7 +1387,7 @@ async function injectPhotosAndReply(token, chatId, urls) {
   const payload = extractGenerate(reply);
   if (payload) { await runGeneration(token, chatId, payload); return; }
   await sbTouch(chatId);
-  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM|FLYER)\s*/i, '').trim() || reply);
+  await sendMessage(token, chatId, reply.replace(/^\s*GENERATE_(?:BPO|OM|FLYER|PROPOSAL)\s*/i, '').trim() || reply);
 }
 
 // A PHOTO arrived: grab bytes (tg-7), store in the bucket, append it to the batch buffer; the settler
@@ -1447,8 +1473,10 @@ export default async function handler(req, res) {
   if (req.method === 'GET' && req.query && req.query.selftest === 'voicecmd') {
     const START = ['new BPO', 'new bpo', 'a new BPO', 'start a new BPO', 'new B.P.O.', 'new B. P. O.', 'start a new one', "let's start a new one", 'start over', 'start fresh', 'begin a new BPO', 'create a new one', 'another BPO', 'do a new valuation', 'okay, can we start a new BPO please', '/new', 'BPO', 'start a bpo',
       // OM fresh-starts incl. common Whisper mis-transcriptions of spoken "OM"
-      'new OM', 'new offering memorandum', 'start an OM', 'OM for Palmer Professional Park', 'another OM', 'new O.M.', 'new oh em', 'new ohm', 'new peo', 'new P.O.'];
-    const GEN = ['generate the BPO', 'build it', 'make the bpo', 'go for it', 'generate', 'build the report', 'run it', "let's go", 'generate the OM', 'build the om'];
+      'new OM', 'new offering memorandum', 'start an OM', 'OM for Palmer Professional Park', 'another OM', 'new O.M.', 'new oh em', 'new ohm', 'new peo', 'new P.O.',
+      // PROPOSAL fresh-starts ("proposal" survives transcription cleanly)
+      'new proposal', 'seller proposal', 'listing proposal', 'new rep proposal', 'start a seller representation proposal', 'proposal for 6360 Carpenter Rd SE', 'make a proposal'];
+    const GEN = ['generate the BPO', 'build it', 'make the bpo', 'go for it', 'generate', 'build the report', 'run it', "let's go", 'generate the OM', 'build the om', 'generate the proposal'];
     const DATA = ['the property is new construction', 'new listing on Higgins', 'start with the address 123 Main St', 'the new owner took over in 2020', 'new roof installed last year', 'I have one more comp coming', 'the asking price is 1.6 million', 'starting the financials at 96k NOI', 'do a new comp photo', 'make it a corner unit',
       // OM-adjacent decoys that must NOT trip OM/BPO routing
       'new PO box', 'my P.O. box number', 'the peony lane listing', 'a promo flyer went out'];
