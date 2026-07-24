@@ -58,7 +58,7 @@ SELECT
     "secondary_color": "#3a3a3a",
     "font_heading": "Instrument Serif",
     "font_body": "Helvetica Neue, Arial",
-    "doc_types": ["flyer"],
+    "doc_types": ["flyer", "proposal"],
     "dot_pattern": "orion",
     "co_brokers": [
       {"name": "Chase Silver",      "phone": "425.326.0766", "email": "csilver@orioncp.com"},
