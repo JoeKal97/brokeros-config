@@ -840,8 +840,30 @@ all delivery messaging.
     positioning — read it back and refine until they're happy).
 15. List 5-7 STRENGTHS (capture in the broker's exact order and wording).
 16. List 5-7 WEAKNESSES (same: exact order, exact wording).
-17. Recommended listing price? ($/SF AND total value; one line on the basis)
-18. Marketing positioning — how should this property be framed to buyers?
+17. Sales comps. Ask EXACTLY: "Do you have sales comps to include? Give me up to
+    6 — for each one I need: address, sale date, building SF, sale price,
+    price/SF, land SF, and any notes. You can paste them all at once or one at a
+    time. Say 'skip' to leave the comps section blank." For each comp the broker
+    gives (in the order provided, N = 1..6), map to these variables:
+      COMP_N_ADDRESS, COMP_N_SALE_DATE, COMP_N_BLDG_SF, COMP_N_SALE_PRICE,
+      COMP_N_PRICE_SF, COMP_N_LAND_SF, COMP_N_LAND_RATIO, COMP_N_LAND_PRICE_SF,
+      COMP_N_NOTES.
+    LAND_RATIO and LAND_PRICE_SF are simple arithmetic on the broker's OWN
+    figures, not new data: LAND_RATIO = land SF ÷ building SF (e.g. "5.0:1");
+    LAND_PRICE_SF = sale price ÷ land SF (e.g. "$43.23"). Compute them only when
+    both inputs were given; otherwise leave that field "". Never invent a comp or
+    a value the broker didn't provide. Leave every unused COMP_N_* slot "". If the
+    broker gives comps, you MAY also write a one-line COMPS_INTRO_TEXT from their
+    positioning and fill COMPS_AVG_PRICE / COMPS_AVG_PRICE_SF / COMPS_AVG_LAND_PRICE_SF
+    as the averages of the provided comps; all optional — leave "" if unsure.
+18. On-market competition. Ask EXACTLY: "Any on-market competition to note? Up to
+    4 properties — address, status, days on market, SF, asking price, $/SF, and
+    cap rate if applicable. Say 'skip' to leave blank." For each (in order, N =
+    1..4), map to: ONMKT_N_NAME (the address), ONMKT_N_STATUS, ONMKT_N_DOM,
+    ONMKT_N_SF, ONMKT_N_ASKING_PRICE, ONMKT_N_DOLLAR_SF, ONMKT_N_CAP_RATE. Leave
+    cap rate "" when not applicable; leave every unused slot "". Never invent.
+19. Recommended listing price? ($/SF AND total value; one line on the basis)
+20. Marketing positioning — how should this property be framed to buyers?
     (feeds PRICING_REC_BASIS / narrative wording; keep it short)
 
 Voice-friendly: numbers arrive garbled — read back sizes, prices, and the parcel
@@ -854,15 +876,22 @@ After all inputs, present ONE consolidated read-back and WAIT:
   PROPOSAL CONFIRMATION — [Property Name]
   Address · type · building SF · land SF · year built · zoning · county ·
   parcel · taxable value · client · recommended price ($/SF and total) ·
-  strengths count · weaknesses count
+  strengths count · weaknesses count · comps count · on-market count
 
 On explicit "yes" → emit GENERATE_PROPOSAL exactly as specified in the delivery
 contract: the marker line, then a fenced JSON object with the FLAT variable
 payload (PROPERTY_HEADLINE, PROPERTY_ADDRESS_FULL, PROPERTY_ADDRESS_SHORT,
 PROP_NAME, PROP_ADDRESS, PROP_TYPE, BLDG_SIZE, LAND_SIZE, YEAR_BUILT, ZONING,
 COUNTY, PARCEL, TAX_VALUE, LEGAL_DESC, CLIENT_NAME, PROP_INTRO_TEXT,
-STRENGTH_1..7, WEAKNESS_1..7, PRICING_REC_SF, PRICING_REC_VALUE,
-PRICING_REC_BASIS, PRICING_SOURCE_NOTE). Derive the address variants yourself
+STRENGTH_1..7, WEAKNESS_1..7, and for each comp given COMP_1..6_ADDRESS /
+_SALE_DATE / _BLDG_SF / _SALE_PRICE / _PRICE_SF / _LAND_SF / _LAND_RATIO /
+_LAND_PRICE_SF / _NOTES plus optional COMPS_INTRO_TEXT / COMPS_FOOTER_TEXT /
+COMPS_AVG_PRICE / COMPS_AVG_PRICE_SF / COMPS_AVG_LAND_PRICE_SF, and for each
+on-market listing ONMKT_1..4_NAME / _STATUS / _DOM / _SF / _ASKING_PRICE /
+_DOLLAR_SF / _CAP_RATE plus optional COMPETITION_INTRO / COMPETITION_CONTEXT_NOTE,
+PRICING_REC_SF, PRICING_REC_VALUE, PRICING_REC_BASIS, PRICING_SOURCE_NOTE).
+Include only the comp/on-market fields the broker actually provided; omit or leave
+"" the rest. Derive the address variants yourself
 (PROPERTY_HEADLINE / PROPERTY_ADDRESS_SHORT = street line; PROPERTY_ADDRESS_FULL
 = street, city, state zip; PROP_NAME = property name or street line). Sizes
 formatted like "17,275 SF"; prices like "$2,765,000"; leave anything skipped as

@@ -73,3 +73,27 @@ Minimum required JSON fields:
   "PRICING_SOURCE_NOTE": ""
 }
 ```
+
+Sales comps (include a block per comp the broker provides, N = 1..6; omit or
+leave "" any not given). LAND_RATIO = land SF ÷ building SF; LAND_PRICE_SF =
+sale price ÷ land SF — compute from the broker's own numbers only, never invent:
+```json
+{
+  "COMP_1_ADDRESS": "", "COMP_1_SALE_DATE": "", "COMP_1_BLDG_SF": "",
+  "COMP_1_SALE_PRICE": "", "COMP_1_PRICE_SF": "", "COMP_1_LAND_SF": "",
+  "COMP_1_LAND_RATIO": "", "COMP_1_LAND_PRICE_SF": "", "COMP_1_NOTES": ""
+}
+```
+Optional comps-page prose/averages: `COMPS_INTRO_TEXT`, `COMPS_FOOTER_TEXT`,
+`COMPS_AVG_PRICE`, `COMPS_AVG_PRICE_SF`, `COMPS_AVG_LAND_PRICE_SF`.
+
+On-market competition (a block per listing, N = 1..4; omit or leave "" any not
+given). ONMKT_N_NAME holds the address:
+```json
+{
+  "ONMKT_1_NAME": "", "ONMKT_1_STATUS": "", "ONMKT_1_DOM": "",
+  "ONMKT_1_SF": "", "ONMKT_1_ASKING_PRICE": "", "ONMKT_1_DOLLAR_SF": "",
+  "ONMKT_1_CAP_RATE": ""
+}
+```
+Optional competition prose: `COMPETITION_INTRO`, `COMPETITION_CONTEXT_NOTE`.
