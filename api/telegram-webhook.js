@@ -1267,8 +1267,11 @@ async function handleCoStarPdf(token, chatId, orgId, doc) {
 // ---- Word-doc (OM / Proposal) ingestion --------------------------------------
 async function handleDocxUpload(token, chatId, orgId, doc) {
   const stop = startTyping(token, chatId);
+  let lockTaken = false;
   try {
-    await sendMessage(token, chatId, '📄 Got your Word doc — extracting property data now ⏳');
+    // Queue behind any in-flight turn and ack; then extract and inject straight into the session.
+    lockTaken = await fileGateAcquire(token, chatId, '📄 Got your Word doc — extracting property data now ⏳');
+    if (!lockTaken) return;
     const meta = await tgGetFile(token, doc.file_id);
     const bytes = meta && meta.file_path ? await tgDownloadFile(token, meta.file_path) : null;
     if (!bytes) { await sendMessage(token, chatId, 'Couldn’t download that file from Telegram — send it again.'); return; }
@@ -1282,32 +1285,47 @@ async function handleDocxUpload(token, chatId, orgId, doc) {
       await sendMessage(token, chatId, `⚠️ Couldn't read that document${result && result.error ? `: ${result.error}` : '. Please try again.'}`);
       return;
     }
-    // Link the session to this property; OM drafts also set the doc type so photo uploads route right.
-    if (!(await sbGet(chatId))) { try { const s = await newSession(); await sbUpsert(chatId, s.id, s.envId); } catch { /* optional */ } }
-    await sbPatch(chatId, { last_property_key: result.propertyKey });
-    if (result.docType === 'om') await sbSetDocType(chatId, 'om');
+    recordUpload(chatId, { name: doc.file_name || 'your document', kind: 'docx', supported: true, readable: 'Word document' });
 
-    const p = result.payload || {};
+    // Ensure a session, tag the doc type (so photo routing + acks match), link the property.
+    let row = await sbGet(chatId);
+    let sessionId;
+    if (!row) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
+    else sessionId = row.session_id;
+    await sbPatch(chatId, { last_property_key: result.propertyKey });
+    await sbSetDocType(chatId, result.docType); // 'om' | 'proposal'
+
+    // Inject the extracted fields as PRE-FILLED intake answers (no DB draft round-trip). The agent
+    // maps them into its intake, presents ONE confirmation, and waits — exactly the xlsx pattern.
     const typeLabel = result.docType === 'om' ? 'Offering Memorandum' : 'Seller Representation Proposal';
-    const lines = [`✅ Extracted ${typeLabel} draft for ${p.property_name || p.address || 'this property'} (${result.extractedFields} fields).`, ''];
-    if (p.address) lines.push(`📍 ${p.address}`);
-    if (p.t12_noi || p.noi_assumption) lines.push(`💰 NOI: ${p.t12_noi || p.noi_assumption}`);
-    if (p.total_residential_units) lines.push(`🏢 Units: ${p.total_residential_units}`);
-    if (p.offering_price || p.pricing_primary_recommended) lines.push(`💲 Price: ${p.offering_price || p.pricing_primary_recommended}`);
-    if (result.photoSlots > 0) {
-      lines.push('');
-      lines.push(`📷 The doc has ${result.photoSlots} photo slots — send photos any time and I'll place them.`);
+    const genSignal = result.docType === 'om' ? 'GENERATE_OM' : 'GENERATE_PROPOSAL';
+    const injection =
+      `[The broker uploaded a ${typeLabel} Word draft. The system has ALREADY extracted it — do NOT ask them to re-type anything below. Map these extracted fields into your ${typeLabel} intake as PRE-FILLED answers, carry values VERBATIM, never invent or recompute what's missing (leave those blank), present ONE consolidated CONFIRMATION of what you captured, and WAIT for the broker to confirm. On confirmation, emit ${genSignal} with the full payload.` +
+      (result.photoSlots > 0 ? ` The doc has ${result.photoSlots} photo placeholder slots — the broker can send photos any time.` : '') +
+      `]\nEXTRACTED DRAFT (JSON):\n${JSON.stringify(result.payload)}`;
+
+    const deadline = Date.now() + 200000;
+    let reply;
+    try { reply = await sendTurn(sessionId, injection, deadline); }
+    catch (e) {
+      const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId);
+      reply = await sendTurn(sessionId, injection, deadline);
     }
-    lines.push('');
-    if (result.stored === false) lines.push(`⚠️ Extracted but NOT saved (${result.storageError || 'storage unavailable'}) — Joe needs to run the migration, then re-upload.`);
-    else lines.push(result.docType === 'om'
-      ? 'Reply "generate OM" when you\'re ready and I\'ll build it from this draft.'
-      : 'Draft stored. The branded Proposal PDF is the next build — your data is saved and ready for it.');
-    await sendMessage(token, chatId, lines.join('\n'));
+    if (!reply) {
+      await sendMessage(token, chatId, `✅ Extracted your ${typeLabel} (${result.extractedFields} fields), but couldn’t get the confirmation back in time — say “generate ${result.docType === 'om' ? 'OM' : 'proposal'}” and I’ll continue from the extracted data.`);
+      return;
+    }
+    const payload = extractGenerate(reply);
+    if (payload) { await runGeneration(token, chatId, payload); return; }
+    await sbTouch(chatId);
+    await sendMessage(token, chatId, reply);
   } catch (e) {
     console.error('handleDocxUpload error:', (e && e.message) || e);
     try { await sendMessage(token, chatId, '⚠️ Error processing Word doc. Please try again.'); } catch { /* ignore */ }
-  } finally { stop(); }
+  } finally {
+    if (lockTaken) await sbReleaseLock(chatId);
+    stop();
+  }
 }
 
 // Draft + comp retrieval for the generate-from-docx flow.

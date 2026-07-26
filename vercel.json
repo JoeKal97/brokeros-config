@@ -12,6 +12,9 @@
       "maxDuration": 60,
       "includeFiles": "templates/proposal-template-v3.html"
     },
+    "api/parse-docx.js": {
+      "maxDuration": 300
+    },
     "api/telegram-webhook.js": {
       "maxDuration": 300,
       "includeFiles": "node_modules/mupdf/dist/**"

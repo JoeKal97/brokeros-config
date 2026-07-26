@@ -11,7 +11,10 @@
 
 import { inflateRawSync } from 'node:zlib';
 
-export const config = { maxDuration: 60 };
+// A full OM extraction (rent roll + every array) generates ~6k output tokens ≈ ~100s of model
+// time, which blows a 60s cap. 300s (matching the webhook) gives real headroom so the endpoint
+// returns instead of 504-ing mid-extraction. The webhook awaits this inside its own 300s budget.
+export const config = { maxDuration: 300 };
 
 const SB_URL = process.env.SUPABASE_URL;
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -186,35 +189,54 @@ Extract the following fields as JSON. Use null for any field not found.
   "firm_website": string
 }`;
 
+// Extract via a FORCED tool call. The model's tool input is returned already parsed by the
+// API, so this eliminates the whole "model emitted almost-JSON that JSON.parse chokes on"
+// failure class (unescaped quotes/newlines inside CRE prose broke the old text-parse path and
+// dropped the entire extraction to null). The prose schema still guides WHICH fields to fill;
+// input_schema stays permissive so every schema key (and its nested arrays) passes through.
 async function extractPayload(text, docType) {
   const { default: Anthropic } = await import('@anthropic-ai/sdk');
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 8000,
-    messages: [{
-      role: 'user',
-      content: `You are extracting structured data from a commercial real estate ${docType === 'om' ? 'Offering Memorandum' : 'Seller Representation Proposal'} Word document.
+  const schema = docType === 'om' ? OM_SCHEMA : PROPOSAL_SCHEMA;
+  let response;
+  try {
+    response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 16000, // full OMs (40-unit rent roll + every array) can exceed 8k output tokens
+      tools: [{
+        name: 'emit_extraction',
+        description: 'Return every field extracted from the document. Call exactly once.',
+        input_schema: { type: 'object', additionalProperties: true },
+      }],
+      tool_choice: { type: 'tool', name: 'emit_extraction' },
+      messages: [{
+        role: 'user',
+        content: `You are extracting structured data from a commercial real estate ${docType === 'om' ? 'Offering Memorandum' : 'Seller Representation Proposal'} Word document.
 
 Extract exactly what is present. Do not invent, infer, or fill in data that isn't explicitly in the document.
 Photo placeholder markers like "PHOTO PLACEHOLDER" should be ignored.
 Internal notes or comments in brackets like "[need to re-do]" should be ignored.
 
-${docType === 'om' ? OM_SCHEMA : PROPOSAL_SCHEMA}
-
-Return ONLY valid JSON, no preamble, no markdown backticks, no explanation.
+Call emit_extraction with these fields (use null or omit anything not found):
+${schema}
 
 DOCUMENT TEXT:
 ${text.slice(0, 32000)}`,
-    }],
-  });
-  const raw = (response.content.find((b) => b.type === 'text') || {}).text || '{}';
-  try {
-    return JSON.parse(raw.replace(/```json|```/g, '').trim());
-  } catch {
-    console.error('docx extraction parse error:', raw.slice(0, 500));
+      }],
+    });
+  } catch (e) {
+    console.error('docx extraction request error:', (e && e.message) || e);
     return null;
   }
+  const toolUse = (response.content || []).find((b) => b.type === 'tool_use');
+  if (toolUse && toolUse.input && typeof toolUse.input === 'object') return toolUse.input;
+  // Fallback: if for any reason no tool block came back, try to parse any text block leniently.
+  const raw = ((response.content || []).find((b) => b.type === 'text') || {}).text || '';
+  if (raw) {
+    try { return JSON.parse(raw.replace(/```json|```/g, '').trim()); } catch { /* fall through */ }
+  }
+  console.error('docx extraction: no tool_use block and no parseable text');
+  return null;
 }
 
 export default async function handler(req, res) {
@@ -226,7 +248,7 @@ export default async function handler(req, res) {
   const chatId = body.chat_id;
   const orgId = body.org_id || null;
   if (!docxBase64 || !chatId) return res.status(400).json({ error: 'Missing required: docx_base64, chat_id' });
-  if (!SB_URL || !SB_KEY) return res.status(500).json({ error: 'Supabase not configured' });
+  // No Supabase dependency anymore — extraction returns the payload for at-upload injection.
 
   let text;
   try {
@@ -245,33 +267,9 @@ export default async function handler(req, res) {
   const propertyKey = String(payload.property_name || payload.address || 'unknown')
     .toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80) || 'unknown';
 
-  // Upsert the draft (unique on chat+property_key — re-uploading a revised doc replaces it).
-  const up = await fetch(`${SB_URL}/rest/v1/docx_drafts?on_conflict=telegram_chat_id,property_key`, {
-    method: 'POST',
-    headers: { ...sbHeaders(), Prefer: 'resolution=merge-duplicates,return=minimal' },
-    body: JSON.stringify({
-      telegram_chat_id: String(chatId),
-      org_id: orgId,
-      property_key: propertyKey,
-      doc_type: docType,
-      property_name: payload.property_name || null,
-      property_address: payload.address || null,
-      payload_json: payload,
-      photo_slots: photoSlots,
-      status: 'draft',
-      updated_at: new Date().toISOString(),
-    }),
-  });
-  let stored = up.ok;
-  let storageError = null;
-  if (!up.ok) {
-    const detail = await up.text().catch(() => '');
-    storageError = /PGRST205|Could not find the table/i.test(detail)
-      ? 'table "docx_drafts" missing — run docs/costar-docx-migration.sql'
-      : detail.slice(0, 200);
-    console.error('docx upsert failed:', storageError);
-  }
-
+  // No persistence: the extracted payload is returned to the webhook, which injects it straight
+  // into the agent session as pre-filled intake answers. Nothing to store — a draft only mattered
+  // for a later "generate from draft" round-trip, which the at-upload injection now supersedes.
   const extractedFields = Object.keys(payload).filter((k) => {
     const v = payload[k];
     return v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && !v.length);
@@ -283,8 +281,6 @@ export default async function handler(req, res) {
     propertyKey,
     photoSlots,
     extractedFields,
-    stored,
-    ...(storageError ? { storageError } : {}),
     payload,
   });
 }
