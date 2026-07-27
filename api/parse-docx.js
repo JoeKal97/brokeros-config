@@ -78,9 +78,25 @@ function docxToText(base64) {
 
 function detectDocType(text) {
   const lower = text.toLowerCase();
-  if (lower.includes('offering memorandum') && lower.includes('rent roll')) return 'om';
-  if (lower.includes('seller representation') || lower.includes('representation services')) return 'proposal';
+  // Explicit investment-analysis docs win first (unambiguous title language).
   if (lower.includes('offering memorandum')) return 'om';
+  if (lower.includes('seller representation') || lower.includes('representation services')) return 'proposal';
+  // Otherwise weigh marketing/listing (flyer) signals against investment-analysis signals.
+  // A flyer/listing sheet reads like leasing/sale marketing (For Lease, available SF, lease
+  // rate, highlights) and LACKS the deep financials of an investment write-up (rent roll, cap
+  // rate, NOI, pro forma, unit mix). Route to flyer when marketing language is present and at
+  // least ties the investment language; a financials-heavy doc stays 'proposal' (the default).
+  const count = (re) => (lower.match(re) || []).length;
+  const invScore =
+    count(/\brent roll\b/g) + count(/\bcap rate\b/g) + count(/\bnoi\b/g) +
+    count(/\bpro ?forma\b/g) + count(/\binvestment highlights\b/g) + count(/\bunit mix\b/g) +
+    count(/\bt-?12\b/g) + count(/\bnet operating income\b/g);
+  const flyScore =
+    count(/\bfor lease\b/g) + count(/\bfor sale\b/g) + count(/\bavailable (?:sf|space|square)\b/g) +
+    count(/\blease rate\b/g) + count(/call broker for rates/g) + count(/\bflyer\b/g) +
+    count(/\b(?:space|building|property) highlights\b/g) + count(/\bnnn\b/g) +
+    count(/\$[\d.,]+ ?\/ ?sf/g);
+  if (flyScore > 0 && flyScore >= invScore) return 'flyer';
   return 'proposal'; // default
 }
 
@@ -194,10 +210,38 @@ Extract the following fields as JSON. Use null for any field not found.
 // failure class (unescaped quotes/newlines inside CRE prose broke the old text-parse path and
 // dropped the entire extraction to null). The prose schema still guides WHICH fields to fill;
 // input_schema stays permissive so every schema key (and its nested arrays) passes through.
+const FLYER_SCHEMA = `
+Extract the following fields as JSON. Use null for any field not found.
+Do not invent data. Extract only what is explicitly present in the document.
+
+{
+  "property_name": string,
+  "address": string,
+  "city_state_zip": string,
+  "listing_type": string,          // "For Lease" or "For Sale" (whichever the doc markets)
+  "suite": string,
+  "available_sf": string,
+  "demisable_sf": string,          // only if the space is described as demisable
+  "lease_rate": string,            // e.g. "$18.00/SF NNN", or "Call Broker for Rates"
+  "sale_price": string,            // if a For Sale flyer lists a price
+  "building_highlights": [string], // VERBATIM, in the document's order
+  "space_highlights": [string],    // VERBATIM, in the document's order
+  "amenities": [string],           // VERBATIM, in the document's order
+  "marketing_description": string, // the property/marketing narrative paragraph(s)
+  "broker_names": [string],
+  "firm_name": string,
+  "firm_address": string,
+  "firm_website": string
+}`;
+
+const SCHEMA_BY_TYPE = { om: OM_SCHEMA, flyer: FLYER_SCHEMA, proposal: PROPOSAL_SCHEMA };
+const DOC_LABEL = { om: 'Offering Memorandum', flyer: 'Property Marketing Flyer', proposal: 'Seller Representation Proposal' };
+
 async function extractPayload(text, docType) {
   const { default: Anthropic } = await import('@anthropic-ai/sdk');
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  const schema = docType === 'om' ? OM_SCHEMA : PROPOSAL_SCHEMA;
+  const schema = SCHEMA_BY_TYPE[docType] || PROPOSAL_SCHEMA;
+  const docLabel = DOC_LABEL[docType] || DOC_LABEL.proposal;
   let response;
   try {
     response = await anthropic.messages.create({
@@ -211,7 +255,7 @@ async function extractPayload(text, docType) {
       tool_choice: { type: 'tool', name: 'emit_extraction' },
       messages: [{
         role: 'user',
-        content: `You are extracting structured data from a commercial real estate ${docType === 'om' ? 'Offering Memorandum' : 'Seller Representation Proposal'} Word document.
+        content: `You are extracting structured data from a commercial real estate ${docLabel} Word document.
 
 Extract exactly what is present. Do not invent, infer, or fill in data that isn't explicitly in the document.
 Photo placeholder markers like "PHOTO PLACEHOLDER" should be ignored.

@@ -1289,20 +1289,34 @@ async function handleDocxUpload(token, chatId, orgId, doc) {
 
     // Ensure a session, tag the doc type (so photo routing + acks match), link the property.
     let row = await sbGet(chatId);
+    const isNewSession = !row;
     let sessionId;
     if (!row) { const s = await newSession(); sessionId = s.id; await sbUpsert(chatId, sessionId, s.envId); }
     else sessionId = row.session_id;
     await sbPatch(chatId, { last_property_key: result.propertyKey });
-    await sbSetDocType(chatId, result.docType); // 'om' | 'proposal'
+    await sbSetDocType(chatId, result.docType); // 'om' | 'proposal' | 'flyer'
 
     // Inject the extracted fields as PRE-FILLED intake answers (no DB draft round-trip). The agent
     // maps them into its intake, presents ONE confirmation, and waits — exactly the xlsx pattern.
-    const typeLabel = result.docType === 'om' ? 'Offering Memorandum' : 'Seller Representation Proposal';
-    const genSignal = result.docType === 'om' ? 'GENERATE_OM' : 'GENERATE_PROPOSAL';
-    const injection =
-      `[The broker uploaded a ${typeLabel} Word draft. The system has ALREADY extracted it — do NOT ask them to re-type anything below. Map these extracted fields into your ${typeLabel} intake as PRE-FILLED answers, carry values VERBATIM, never invent or recompute what's missing (leave those blank), present ONE consolidated CONFIRMATION of what you captured, and WAIT for the broker to confirm. On confirmation, emit ${genSignal} with the full payload.` +
+    const DOC_LABEL = { om: 'Offering Memorandum', flyer: 'Property Marketing Flyer', proposal: 'Seller Representation Proposal' };
+    const GEN_SIGNAL = { om: 'GENERATE_OM', flyer: 'GENERATE_FLYER', proposal: 'GENERATE_PROPOSAL' };
+    const GEN_VERB = { om: 'OM', flyer: 'flyer', proposal: 'proposal' };
+    const typeLabel = DOC_LABEL[result.docType] || DOC_LABEL.proposal;
+    const genSignal = GEN_SIGNAL[result.docType] || GEN_SIGNAL.proposal;
+    let injection =
+      `[The broker uploaded a ${typeLabel} Word draft. The system has ALREADY extracted it — do NOT ask them to re-type anything below. Map these extracted fields into your ${typeLabel} intake as PRE-FILLED answers, carry values VERBATIM (preserve list order for highlights/amenities), never invent or recompute what's missing (leave those blank), present ONE consolidated CONFIRMATION of what you captured, and WAIT for the broker to confirm. On confirmation, emit ${genSignal} with the full payload.` +
       (result.photoSlots > 0 ? ` The doc has ${result.photoSlots} photo placeholder slots — the broker can send photos any time.` : '') +
       `]\nEXTRACTED DRAFT (JSON):\n${JSON.stringify(result.payload)}`;
+    // A doc-created session is brand new: firm bots (flyers especially) need their identity + broker
+    // roster tag on the FIRST turn, exactly as runTurn injects it, or the agent defaults to the solo
+    // persona and loses the roster for broker selection.
+    if (isNewSession) {
+      const org = await sbGetOrgByToken(token);
+      if (org) {
+        const roster = ((org.brand_config && org.brand_config.co_brokers) || []).map((b) => b && b.name).filter(Boolean);
+        injection = `[BOT IDENTITY: firm — ${org.org_name}. Shared firm bot: greet neutrally and briefly, never use a personal broker name, never present yourself as Jessie or Eagen Real Estate. Supported doc types: ${((org.brand_config && org.brand_config.doc_types) || ['flyer']).join(', ')}. Broker roster: ${roster.join(', ') || 'none on file'}.]\n` + injection;
+      }
+    }
 
     const deadline = Date.now() + 200000;
     let reply;
@@ -1312,7 +1326,7 @@ async function handleDocxUpload(token, chatId, orgId, doc) {
       reply = await sendTurn(sessionId, injection, deadline);
     }
     if (!reply) {
-      await sendMessage(token, chatId, `✅ Extracted your ${typeLabel} (${result.extractedFields} fields), but couldn’t get the confirmation back in time — say “generate ${result.docType === 'om' ? 'OM' : 'proposal'}” and I’ll continue from the extracted data.`);
+      await sendMessage(token, chatId, `✅ Extracted your ${typeLabel} (${result.extractedFields} fields), but couldn’t get the confirmation back in time — say “generate ${GEN_VERB[result.docType] || 'proposal'}” and I’ll continue from the extracted data.`);
       return;
     }
     const payload = extractGenerate(reply);
