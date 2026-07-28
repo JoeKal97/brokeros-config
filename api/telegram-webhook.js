@@ -1393,12 +1393,11 @@ async function injectPhotosAndReply(token, chatId, urls) {
   await sendMessage(token, chatId, many ? `Got your ${n} photos — I’ll place them across the ${isOm ? 'OM' : isFlyer ? 'flyer' : 'BPO'}.` : 'Got the property photo.');
   const injection = isFlyer
     ? `[The broker sent ${n} photo${many ? 's together (a batch)' : ''} for the FLYER. Public URL${many ? 's, in upload order' : ''}:\n${urls.map((u, i) => `${i + 1}. ${u}`).join('\n')}\n` +
-      `FLYER PHOTO RULES (slot-by-slot collection):\n` +
-      `- You collect photos ONE SLOT AT A TIME in this fixed order: hero exterior (p1) -> interior (p1) -> floor plan (p2) -> office interior (p2) -> aerial/parking (p3 top) -> up to 3 detail shots (p3 row).\n` +
-      `- Assign ${many ? 'these URLs' : 'this URL'} to the slot(s) you are currently collecting, IN ORDER, starting at the slot you last asked for and continuing down the sequence if extra photos arrived. Do NOT ask the broker to label photos.\n` +
+      `FLYER PHOTO RULES (deterministic 3-step script):\n` +
+      `- The scripted intake asks for THREE slots in this fixed order: hero exterior (p1) -> interior (p1) -> floor plan (p2). Assign ${many ? 'these URLs' : 'this URL'} to the slot(s) you are currently collecting, IN ORDER. Extra photos beyond the script fill office (p2), aerial (p3), then detail shots (p3) only if the broker labeled them. Do NOT ask the broker to label photos.\n` +
       `- EXCEPTION: if the broker's own words (before or after the upload) said what a photo is ("this is the floor plan"), honor that over the sequence.\n` +
       `- Fields: photos.hero_url, photos.interior_url, photos.aerial_url, photos.detail_urls (array, max 3), photos.office_url, floor_plan_url. "photos" is an OBJECT, not an array. Keep everything placed earlier.\n` +
-      `- Reply with a SHORT acknowledgment naming what was placed, then immediately ask for the NEXT unfilled slot by name ("Got the floor plan. Now the office interior for page 2 — or say skip."). If all slots are filled or skipped, continue the flyer intake flow.]`
+      `- Reply with the script's EXACT receipt line for the slot just filled: after hero -> "Hero shot saved. Now send the interior photo for page 1 — or say skip." | after interior -> "Got it. Now send the floor plan for page 2 — or say skip." | after floor plan -> "Floor plan saved. Page 4 will auto-populate with nearby amenities from Google Places — say skip to use auto, or send a custom list." No other phrasing, never "got any more?".]`
     : isOm
     ? `[The broker sent ${n} property photo${many ? 's together (a batch)' : ''} for the OM. Public URL${many ? 's IN ORDER' : ''}:\n${urls.join('\n')}\n` +
       `OM PHOTO RULES:\n` +
@@ -1587,7 +1586,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ selftest: 'whisper', key_present: !!k, key_len: k.length });
   }
   if (req.method === 'GET' || (req.query && req.query.version !== undefined)) {
-    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 9 });
+    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 10 });
   }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
