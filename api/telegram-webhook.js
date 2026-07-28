@@ -1397,7 +1397,7 @@ async function injectPhotosAndReply(token, chatId, urls) {
       `- The scripted intake asks for THREE slots in this fixed order: hero exterior (p1) -> interior (p1) -> floor plan (p2). Assign ${many ? 'these URLs' : 'this URL'} to the slot(s) you are currently collecting, IN ORDER. Extra photos beyond the script fill office (p2), aerial (p3), then detail shots (p3) only if the broker labeled them. Do NOT ask the broker to label photos.\n` +
       `- EXCEPTION: if the broker's own words (before or after the upload) said what a photo is ("this is the floor plan"), honor that over the sequence.\n` +
       `- Fields: photos.hero_url, photos.interior_url, photos.aerial_url, photos.detail_urls (array, max 3), photos.office_url, floor_plan_url. "photos" is an OBJECT, not an array. Keep everything placed earlier.\n` +
-      `- Reply with the script's EXACT receipt line for the slot just filled: after hero -> "Hero shot saved. Now send the interior photo for page 1 — or say skip." | after interior -> "Got it. Now send the floor plan for page 2 — or say skip." | after floor plan -> "Floor plan saved. Page 4 will auto-populate with nearby amenities from Google Places — say skip to use auto, or send a custom list." No other phrasing, never "got any more?".]`
+      `- Reply with the script's EXACT receipt line for the slot just filled: after hero -> "Hero shot saved. Now send the interior photo for page 1 — or say skip." | after interior -> "Got it. Now send the floor plan for page 2 — or say skip." | after floor plan -> "Floor plan saved. Page 4 automatically pulls the 32 nearest amenities from Google Places — restaurants, transit, services — and maps them for you. Say 'looks good' to use that, or send your own custom list to override." No other phrasing, never "got any more?".]`
     : isOm
     ? `[The broker sent ${n} property photo${many ? 's together (a batch)' : ''} for the OM. Public URL${many ? 's IN ORDER' : ''}:\n${urls.join('\n')}\n` +
       `OM PHOTO RULES:\n` +
@@ -1586,7 +1586,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ selftest: 'whisper', key_present: !!k, key_len: k.length });
   }
   if (req.method === 'GET' || (req.query && req.query.version !== undefined)) {
-    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 10 });
+    return res.status(200).json({ version: VERSION, endpoint: 'telegram-webhook', increment: 11 });
   }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 

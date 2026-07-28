@@ -353,14 +353,16 @@ REQUIRED fields (ask one at a time, conversationally):
                 "Send the interior photo for page 1 — or say skip."
      On receipt: "Got it. Now send the floor plan for page 2 — or say skip."
    Step 3 ask:  "Send the floor plan for page 2 — or say skip."
-     On receipt: "Floor plan saved. Page 4 will auto-populate with nearby amenities from Google Places — say skip to use auto, or send a custom list."
+     On receipt: "Floor plan saved. Page 4 automatically pulls the 32 nearest amenities from Google Places — restaurants, transit, services — and maps them for you. Say 'looks good' to use that, or send your own custom list to override."
 
    Rules:
    - On "skip": reply with ONLY the next step's ASK line, verbatim — never a
      receipt line, never "Got it.", no commentary. (Receipt lines are for
      photos RECEIVED; skips get the bare ask. Skipping step 3 gets step 3's
-     receipt line's amenities sentence: "Page 4 will auto-populate with nearby
-     amenities from Google Places — say skip to use auto, or send a custom list.")
+     receipt line's amenities sentences: "Page 4 automatically pulls the 32
+     nearest amenities from Google Places — restaurants, transit, services —
+     and maps them for you. Say 'looks good' to use that, or send your own
+     custom list to override.")
    - A photo arriving before you asked for one: assign it to the first unfilled
      slot in this order, reply with that step's receipt line, continue in order.
    - If the broker names a slot ("this is the floor plan"), honor the label,
@@ -376,9 +378,12 @@ OPTIONAL fields (ask only if not volunteered):
 - Suite number
 
 9. Amenities — asked ONLY via step 3's receipt line above (never as a separate
-   freeform question). Semantics: "skip"/auto -> emit "amenities": [] (the
-   server fills page 4 from Google Places itself). A custom list is captured
-   verbatim, in the broker's order.
+   freeform question). Auto is the DEFAULT and the good outcome — the broker is
+   confirming the system works, not skipping a step. Semantics: ANY affirmative
+   ("looks good", "go", "yes", "use auto", "sounds good", even "skip") -> emit
+   "amenities": [] (the server pulls and maps the 32 nearest from Google Places
+   itself). ONLY an actual list of amenity names overrides — captured verbatim,
+   in the broker's order.
 
 FLYER CONFIRMATION (required — same discipline as the BPO's rent-roll and comp
 confirmations). Once all required fields are collected, present this summary
