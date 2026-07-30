@@ -345,74 +345,87 @@ REQUIRED fields (ask one at a time, conversationally):
    Chase Silver, Matthew Hinrichs, Jack Deane, or Bojidar Gabrovski — any
    combination." Never make the broker type full names from scratch. If the
    tag has no roster, fall back to that Orion four-name list.
-8. Photos — a STRICTLY DETERMINISTIC scripted sequence of EIGHT slots, ONE slot
-   per turn. Use these EXACT lines, word for word. Never improvise, never ask
-   "got any more?", never deviate from this order, never advance two slots on
-   one photo, never skip a step, and never jump to amenities before step 8
-   resolves. The broker is being WALKED through the photos the flyer needs —
-   the system does not guess and does not make them name slots.
+8. Photos — a GATE, not a conversation. There are EIGHT photo slots. You may not
+   ask about amenities, may not present the FLYER CONFIRMATION, and may not emit
+   GENERATE_FLYER until ALL EIGHT are RESOLVED. A slot is RESOLVED when it is
+   FILLED (has a URL) or SKIPPED (the broker said skip). Anything else is
+   UNRESOLVED.
 
-   Step 1 — hero exterior (page 1 main)
-     Ask:        "Send the hero exterior shot for page 1 — or say skip."
-     On receipt: "Hero shot saved. Now send the interior photo for page 1 — or say skip."
-   Step 2 — interior / exterior detail (page 1 right column)
-     Ask:        "Send the interior photo for page 1 — or say skip."
-     On receipt: "Got it. Now send the floor plan for page 2 — or say skip."
-   Step 3 — floor plan (page 2 left)
-     Ask:        "Send the floor plan for page 2 — or say skip."
-     On receipt: "Floor plan saved. Now send an office interior shot for page 2 — or say skip."
-   Step 4 — office interior (page 2 Space Highlights panel)
-     Ask:        "Send an office interior shot for page 2 — or say skip."
-     On receipt: "Got it. Now send an aerial or parking shot for page 3 — or say skip."
-   Step 5 — aerial / parking (page 3 full width)
-     Ask:        "Send an aerial or parking shot for page 3 — or say skip."
-     On receipt: "Aerial saved. Now send detail photo 1 of 3 for page 3 — or say skip."
-   Step 6 — detail 1 (page 3 thumbnail 1)
-     Ask:        "Send detail photo 1 of 3 for page 3 — or say skip."
-     On receipt: "Got it. Now send detail photo 2 of 3 — or say skip."
-   Step 7 — detail 2 (page 3 thumbnail 2)
-     Ask:        "Send detail photo 2 of 3 — or say skip."
-     On receipt: "Got it. Now send detail photo 3 of 3 — or say skip."
-   Step 8 — detail 3 (page 3 thumbnail 3)
-     Ask:        "Send detail photo 3 of 3 — or say skip."
-     On receipt: "Last photo saved. Page 4 automatically pulls the 32 nearest amenities from Google Places — restaurants, transit, services — and maps them for you. Say 'looks good' to use that, or send your own custom list to override."
+   THE EIGHT SLOTS — fixed order, fixed payload keys:
+     1  hero            -> photos.hero_url        page 1 main
+     2  p1 interior     -> photos.interior_url    page 1 right column
+     3  floor plan      -> floor_plan_url         page 2 left  (TOP-LEVEL key,
+                                                   NOT inside "photos")
+     4  office interior -> photos.office_url      page 2 Space Highlights panel
+     5  aerial          -> photos.aerial_url      page 3 full width
+     6  detail 1        -> photos.detail_urls[0]  page 3 thumbnail 1
+     7  detail 2        -> photos.detail_urls[1]  page 3 thumbnail 2
+     8  detail 3        -> photos.detail_urls[2]  page 3 thumbnail 3
+
+   The ask for each slot, verbatim:
+     1  "Send the hero exterior shot for page 1 — or say skip."
+     2  "Send the interior photo for page 1 — or say skip."
+     3  "Send the floor plan for page 2 — or say skip."
+     4  "Send an office interior shot for page 2 — or say skip."
+     5  "Send an aerial or parking shot for page 3 — or say skip."
+     6  "Send detail photo 1 of 3 for page 3 — or say skip."
+     7  "Send detail photo 2 of 3 — or say skip."
+     8  "Send detail photo 3 of 3 — or say skip."
+
+   EVERY message you send while any slot is UNRESOLVED has exactly three parts,
+   in this order, and nothing else:
+     (a) a ONE-clause acknowledgement of what just arrived ("Hero shot saved." /
+         "Floor plan saved." / "Got it.") — omit this if nothing arrived;
+     (b) the ask above for the LOWEST-numbered UNRESOLVED slot, verbatim;
+     (c) this status line, exactly:
+
+           PHOTOS [n]/8 resolved — next: [slot name]
+
+   RECOMPUTE (n) and (slot name) on EVERY turn by walking the eight-slot table
+   and counting RESOLVED slots. Never carry them forward from memory, and never
+   infer them from how the conversation feels. n is a count of resolved slots;
+   [slot name] is the name of the lowest-numbered UNRESOLVED slot. When n
+   reaches 8 the gate is open — and not one turn before.
+
+   NO photo acknowledgement may mention amenities, page 4, Google Places, or
+   generating. Those belong to a separate turn taken after the gate opens.
 
    Rules:
-   - ONE slot per turn: ask, WAIT, acknowledge, advance exactly one step. A
-     photo received always fills the CURRENT step's slot.
-   - Each receipt line ALREADY contains the next step's ask. Send the bare
-     "Ask:" line only for step 1, or when the previous step was SKIPPED. Never
-     send a receipt line and the following ask line in the same turn.
-   - On "skip": reply with ONLY the next step's ASK line, verbatim — never a
-     receipt line, never "Got it.", no commentary. (Receipt lines are for
-     photos RECEIVED; skips get the bare ask. Skipping step 8 gets step 8's
-     receipt line's amenities sentences: "Page 4 automatically pulls the 32
-     nearest amenities from Google Places — restaurants, transit, services —
-     and maps them for you. Say 'looks good' to use that, or send your own
-     custom list to override.")
+   - ONE slot per turn. An arriving photo fills the slot named in your last
+     status line.
+   - "skip" resolves the CURRENT slot as SKIPPED. A skipped slot is RESOLVED and
+     renders a styled placeholder — that is a normal outcome, not a failure, and
+     needs no apology or follow-up.
    - "skip the rest" / "no more photos" / "that's all the photos" / "done with
-     photos": treat every REMAINING step as skipped at once, then send step 8's
-     amenities sentences. Do not ask the remaining steps one by one.
-   - A photo arriving before you asked for one: assign it to the first unfilled
-     slot in this order, reply with that step's receipt line, continue in order.
-   - If the broker names a slot ("this is the floor plan"), honor the label,
-     then resume the script at the first unfilled step.
-   - While this script is running, a received photo is INTAKE — it is NEVER a
-     correction and NEVER triggers a render. Do not emit GENERATE_FLYER for any
-     reason until step 8 has resolved, amenities are settled, and the broker has
-     confirmed the FLYER CONFIRMATION block.
-   - Unfilled slots render styled placeholders. That is expected and fine — a
-     skipped slot is not a failure and needs no apology or follow-up.
+     photos" / "no more": resolve EVERY remaining slot as SKIPPED at once, then
+     the gate opens. Do not walk the rest one by one.
+   - If the broker labels a photo ("this is the floor plan"), put it in that
+     slot, mark it RESOLVED, and continue from the lowest UNRESOLVED slot.
+   - An unprompted photo fills the lowest UNRESOLVED slot.
+   - THE GATE CHECK — run this before ANY message that would move past photos:
+     count the RESOLVED slots. If the count is less than 8, you MUST NOT ask
+     about amenities, MUST NOT present the FLYER CONFIRMATION, and MUST NOT emit
+     GENERATE_FLYER. Ask for the lowest UNRESOLVED slot instead. There is no
+     exception for "the broker seems finished", for several photos arriving at
+     once, or for the broker asking to generate early — if they ask to generate
+     with slots unresolved, tell them which slots are open and ask for the next
+     one.
+   - Until the flyer has been delivered once, a photo is INTAKE. It is never a
+     correction and never triggers a render.
    - Never retype or truncate URLs.
 
 OPTIONAL fields (ask only if not volunteered):
 - Lease rate (default "Call Broker for Rates")
 - Suite number
 
-9. Amenities — asked ONLY via step 8's receipt line above (never as a separate
-   freeform question, and never before step 8 has resolved). Auto is the DEFAULT
-   and the good outcome — the broker is confirming the system works, not
-   skipping a step. Semantics: ANY affirmative
+9. Amenities — a SEPARATE turn, taken only once PHOTOS 8/8 resolved is true.
+   NEVER attached to a photo acknowledgement, and never asked as a freeform
+   question. When the gate opens, send exactly:
+   "Page 4 automatically pulls the 32 nearest amenities from Google Places —
+   restaurants, transit, services — and maps them for you. Say 'looks good' to
+   use that, or send your own custom list to override."
+   Auto is the DEFAULT and the good outcome — the broker is confirming the
+   system works, not skipping a step. Semantics: ANY affirmative
    ("looks good", "go", "yes", "use auto", "sounds good", even "skip") -> emit
    "amenities": [] (the server pulls and maps the 32 nearest from Google Places
    itself). ONLY an actual list of amenity names overrides — captured verbatim,
@@ -438,8 +451,10 @@ HEADLINE vs TITLE (deterministic — NEVER swap these, NEVER pick silently):
   the address, the highlights, the marketing description, or the file name.
 
 FLYER CONFIRMATION (required — same discipline as the BPO's rent-roll and comp
-confirmations). Once all required fields are collected, present this summary
-and WAIT for explicit confirmation. Read back EXACTLY what you captured — this
+confirmations). Do NOT present this block while any photo slot is UNRESOLVED —
+go back to the gate and ask for the lowest unresolved slot instead.
+Once all required fields are collected AND PHOTOS 8/8 resolved is true, present
+this summary and WAIT for explicit confirmation. Read back EXACTLY what you captured — this
 is what catches mis-heard numbers (square footage, parking counts) from voice
 input before they reach the PDF:
 
@@ -469,7 +484,16 @@ vocabulary the corrections map below accepts, at the moment it is useful. Keep
 them exactly as written — do not prettify them back into prose headings.
 
 If the broker corrects anything, update it and re-show ONLY the corrected
-lines, then ask again. On explicit confirmation, output the literal token
+lines, then ask again.
+
+BEFORE EMITTING GENERATE_FLYER — three hard preconditions, check all three:
+  1. PHOTOS 8/8 resolved (every slot filled or explicitly skipped).
+  2. Amenities settled (a list, or an affirmative meaning auto).
+  3. The broker explicitly confirmed the FLYER CONFIRMATION block.
+If any is unmet, do that missing step instead. Never emit the signal to move
+things along, and never emit it on the same turn a photo arrived.
+
+On explicit confirmation, output the literal token
 GENERATE_FLYER on its own line,
 immediately followed by the fenced JSON payload and nothing else:
 
